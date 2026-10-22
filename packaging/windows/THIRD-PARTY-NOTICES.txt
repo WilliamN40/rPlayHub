@@ -1,0 +1,95 @@
+rPlayHub for Windows -- third-party notices
+==========================================
+
+rPlayHub (rplay-gui.exe, the GUI, and cdhost.exe, the engine) is free software under the GNU
+General Public License, version 3 or later: see LICENSE.txt. Source code:
+https://github.com/rPlayAI/rPlayHub
+
+It contains, or is distributed with, the components below. Each remains under its own licence.
+The full licence texts are in the licenses\ folder next to this file.
+
+
+Statically linked into rplay-gui.exe
+------------------------------------
+
+FFmpeg @FFMPEG_VERSION@ -- libavcodec, libswresample, libswscale, libavutil
+  Licence: GNU Lesser General Public License 2.1 or later (licenses\LGPL-2.1.txt,
+           licenses\FFmpeg-LICENSE.md).
+  Built as an LGPL configuration: no --enable-gpl, no --enable-nonfree. Configure line:
+    @FFMPEG_CONFIGURE@
+  Modified: rPlayHub applies one patch to libavcodec's HEVC decoder (RVRA reference-picture
+  resampling, needed to decode an iPhone's screen stream correctly). The patch is shipped
+  as licenses\ffmpeg-rvra.patch and is also in the source repository as
+  patches/ffmpeg-rvra.patch.
+  Corresponding source: the unmodified release is
+    https://ffmpeg.org/releases/ffmpeg-@FFMPEG_VERSION@.tar.xz
+  plus licenses\ffmpeg-rvra.patch; scripts/build-ffmpeg-rvra.sh in the rPlayHub repository
+  fetches, patches and builds exactly that. To relink rplay-gui.exe against a modified FFmpeg,
+  build it from the rPlayHub source (scripts/build-windows.sh), which is available under the
+  GPL. We will also provide the source on request for three years from distribution.
+
+Dear ImGui @IMGUI_VERSION@ -- Copyright (c) 2014-2025 Omar Cornut
+  Licence: MIT (licenses\imgui-LICENSE.txt). https://github.com/ocornut/imgui
+
+nlohmann/json @JSON_VERSION@ -- Copyright (c) 2013-2023 Niels Lohmann
+  Licence: MIT (licenses\MIT-nlohmann-json.txt). https://github.com/nlohmann/json
+
+The MSYS2 build of rplay-gui.exe also links SDL2, zlib, the GCC runtime (libgcc, libstdc++) and
+winpthreads statically; they are listed below.
+
+
+Statically linked into cdhost.exe
+---------------------------------
+
+lwIP 2.2.1 -- Copyright (c) 2001, 2002 Swedish Institute of Computer Science
+  Licence: BSD-3-Clause (licenses\lwIP-COPYING.txt). https://savannah.nongnu.org/projects/lwip/
+
+
+From MSYS2 (UCRT64): static in rplay-gui.exe, or DLLs next to cdhost.exe
+------------------------------------------------------------------------
+
+These are unmodified builds from the MSYS2 project. Each DLL shipped can be replaced by a
+compatible build of the same library. Source for every MSYS2 package, including the exact
+build recipe, is at https://github.com/msys2/MINGW-packages and the source archives at
+https://repo.msys2.org/mingw/sources/. The DLLs actually shipped, with the package and version
+each came from, are listed at the end of this file.
+
+libimobiledevice, libimobiledevice-glue, libusbmuxd, libplist (DLLs, used by cdhost.exe)
+  Licence: GNU Lesser General Public License 2.1 or later (licenses\LGPL-2.1.txt).
+  https://libimobiledevice.org -- https://github.com/libimobiledevice
+
+OpenSSL 3 (libssl, libcrypto; DLLs, used by cdhost.exe)
+  Licence: Apache License 2.0 (licenses\OpenSSL-LICENSE.txt). https://www.openssl.org
+
+SDL2 (static in rplay-gui.exe) -- Copyright (C) 1997-2025 Sam Lantinga
+  Licence: zlib (licenses\SDL2-LICENSE.txt). https://libsdl.org
+
+zlib (static in rplay-gui.exe, DLL for cdhost.exe) -- Copyright (C) Jean-loup Gailly and Mark Adler
+  Licence: zlib (licenses\zlib-LICENSE.txt). https://zlib.net
+
+MinGW-w64 runtime and winpthreads; GCC runtime libraries (libgcc, libstdc++)
+  Licence: MinGW-w64 runtime licence / ZPL / MIT-style (licenses\MinGW-w64-*.txt,
+           licenses\winpthreads-COPYING.txt); the GCC runtime libraries are GPL-3.0 with the
+           GCC Runtime Library Exception (licenses\GCC-RUNTIME-*.txt), which permits
+           distributing them in compiled programs under terms of the program's choice.
+
+
+Fonts
+-----
+
+Inter (fonts\Inter-*.ttf) -- Copyright (c) 2016 The Inter Project Authors
+  Licence: SIL Open Font License 1.1. https://github.com/rsms/inter
+
+
+Not shipped
+-----------
+
+Apple's Developer Disk Image is Apple's software and is not included. fetch-ddi.ps1 downloads
+it on request from the public mirror https://github.com/doronz88/DeveloperDiskImage.
+Apple Mobile Device Service (from Apple Devices or iTunes) is required and installed separately.
+
+
+Exactly what this build contains
+--------------------------------
+
+@BUNDLED@

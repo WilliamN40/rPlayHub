@@ -1,26 +1,25 @@
 @echo off
+:: Start the rPlayHub GUI from a source checkout. The GUI starts and stops the engine
+:: (cdhost.exe) itself, so there is nothing else to launch -- run-host.bat is only for running
+:: the engine on its own in a console.
+::
+:: Looks for, in order: the staged build (scripts/build-windows.sh), an installed copy, and the
+:: bare build output in client-c\.
+setlocal
 cd /d "%~dp0"
 
-set RPLAY_USERSPACE_NET=1
-if not defined RPLAY_KEYFRAME_EVERY_S set RPLAY_KEYFRAME_EVERY_S=0
-if not defined RPLAY_FPS set RPLAY_FPS=60
-if not defined RPLAY_MAX_BITRATE set RPLAY_MAX_BITRATE=15000000
-if not defined RPLAY_DDI (
-    if exist "%~dp0deps\iOS_DDI" (
-        set "RPLAY_DDI=%~dp0deps\iOS_DDI"
-    )
+set "GUI="
+if exist "%~dp0build\windows\rPlayHub\rplay-gui.exe" set "GUI=%~dp0build\windows\rPlayHub\rplay-gui.exe"
+if not defined GUI if exist "%LOCALAPPDATA%\Programs\rPlayHub\rplay-gui.exe" set "GUI=%LOCALAPPDATA%\Programs\rPlayHub\rplay-gui.exe"
+if not defined GUI if exist "%~dp0client-c\rplay-gui.exe" set "GUI=%~dp0client-c\rplay-gui.exe"
+
+if not defined GUI (
+    echo rplay-gui.exe not found. Build it first, in an MSYS2 UCRT64 shell:
+    echo     scripts/build-windows.sh
+    echo or install rPlayHub with the installer. See doc\WINDOWS.md.
+    pause
+    exit /b 1
 )
 
-:: Start cdhost daemon if not already running
-tasklist /FI "IMAGENAME eq cdhost.exe" 2>NUL | find /I /N "cdhost.exe">NUL
-if "%ERRORLEVEL%"=="1" (
-    echo Starting rPlayHub host daemon...
-    start "rPlayHub Host Daemon" /D "%~dp0host-c" "%~dp0host-c\cdhost.exe"
-    timeout /t 2 /nobreak >nul
-) else (
-    echo rPlayHub host daemon is already running.
-)
-
-:: Start rPlayHub GUI
-echo Launching rPlayHub GUI...
-start "" "%~dp0rplay-gui.exe"
+echo Launching %GUI%
+start "" "%GUI%" %*

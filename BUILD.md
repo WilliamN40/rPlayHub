@@ -16,8 +16,13 @@ both as a `.deb`. The dependencies, the three `scripts/` that build FFmpeg (RVRA
 libimobiledevice stack, the `make` lines and `scripts/package-deb.sh` are all in
 [doc/LINUX.md](doc/LINUX.md).
 
-**Windows** builds the SDL2 + Dear ImGui GUI in `client-c/` using MSVC and the RVRA-patched
-FFmpeg library. See [doc/WINDOWS.md](doc/WINDOWS.md) for prerequisites and build instructions.
+**Windows** builds the same daemon and the same SDL2 + Dear ImGui GUI with MSYS2's UCRT64
+toolchain: `scripts/build-windows.sh` (run in an MSYS2 UCRT64 shell) builds the RVRA-patched
+FFmpeg, `cdhost.exe` and `rplay-gui.exe` and stages a runnable folder with its DLLs in
+`build/windows/rPlayHub/`; `scripts/package-windows.sh` turns that into a per-user NSIS installer
+and a portable zip. On Windows the daemon needs no administrator rights (userspace TCP/IP, no TUN)
+and the GUI starts it. Requirements, the MSVC alternative for the GUI, signing and troubleshooting:
+[doc/WINDOWS.md](doc/WINDOWS.md). **Not yet run against a phone on Windows.**
 
 ---
 
@@ -43,6 +48,9 @@ files on disk. A Mac with Xcode has them; on Linux (or a Mac without Xcode) fetc
 ```sh
 ./scripts/fetch-ddi.sh    # -> ~/.local/share/rplayhub/iOS_DDI, where the engine looks
 ```
+
+On Windows: `powershell -ExecutionPolicy Bypass -File scripts\fetch-ddi.ps1`, into
+`%LOCALAPPDATA%\rplayhub\iOS_DDI`.
 
 They are Apple's, so they are downloaded rather than kept in this repository. Details, other
 sources and troubleshooting: [doc/DDI.md](doc/DDI.md).

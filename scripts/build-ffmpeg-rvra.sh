@@ -8,7 +8,7 @@
 # warnings. patches/ffmpeg-rvra.patch adds that resampling to ffmpeg's hevc decoder, gated
 # behind RPLAY_RVRA=1 and single-threaded decode. See doc/RVRA-AND-PORTABILITY.md.
 #
-# Usage:   scripts/build-ffmpeg-rvra.sh
+# Usage:   scripts/build-ffmpeg-rvra.sh          (JOBS=N limits parallel make jobs)
 # Verify:  RPLAY_RVRA=1 deps/ffmpeg/ffmpeg -threads 1 -r 60 -i reference/captures/apple_video_REFERENCE.h265 \
 #              -fps_mode passthrough -strict -1 -f yuv4mpegpipe cand.y4m
 #          python3 scripts/compare-decodes.py gt.y4m cand.y4m reference/captures/apple_video_REFERENCE.h265
@@ -45,5 +45,7 @@ if [[ ! -f ffbuild/config.mak ]]; then
     ./configure --disable-doc --disable-autodetect --disable-network --enable-zlib \
                 --disable-ffplay --disable-ffprobe
 fi
-make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
+# JOBS=N caps the parallelism (default: every core). On a small or shared machine -- MSYS2 on
+# Windows in particular -- one cc1 per core can run out of memory on libavcodec's largest files.
+make -j"${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 echo "built deps/ffmpeg/ffmpeg (use with RPLAY_RVRA=1 -threads 1)"

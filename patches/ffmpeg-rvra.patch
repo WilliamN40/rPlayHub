@@ -266,7 +266,7 @@
  
      av_refstruct_replace(&dst->hwaccel_picture_private,
                            src->hwaccel_picture_private);
-@@ -4167,6 +4372,35 @@
+@@ -4167,6 +4372,51 @@
      s->sei.picture_timing.picture_struct = 0;
      s->eos = 1;
  

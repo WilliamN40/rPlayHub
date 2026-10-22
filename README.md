@@ -1,12 +1,12 @@
 # rPlayHub
 
 [![Latest release](https://img.shields.io/github/v/release/rPlayAI/rPlayHub?label=download&color=2ea44f)](https://github.com/rPlayAI/rPlayHub/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%7C%20Linux-lightgrey)](#platforms)
+[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%7C%20Linux%20%7C%20Windows%20%28building%29-lightgrey)](#platforms)
 [![iOS](https://img.shields.io/badge/iOS-27%2B-blue)](#requirements)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-yellow)](LICENSE)
 
 **scrcpy for iOS** — and a **cross-platform clone of Apple's Device Hub**. Mirror and control an
-iPhone from **macOS or Linux**, with **Windows and Raspberry Pi** next: live screen
+iPhone from **macOS or Linux**, with **Windows** (building now) and **Raspberry Pi** next: live screen
 and sound, click-to-tap, drag-to-swipe, app and profile management, crash reports and the device's own
 settings.
 
@@ -38,7 +38,8 @@ and storage on the right.
 
 ![rPlayHub on Linux mirroring an iPhone 13 Pro, with the Info tab alongside](doc/images/rplayhub-linux-gui.png)
 
-The Windows client, with native desktop menus and live mirroring:
+The Windows client, from an earlier development build (the current Windows build has not yet
+been run against a phone; see [doc/WINDOWS.md](doc/WINDOWS.md)):
 
 ![rPlayHub on Windows mirroring an iPhone with native menus and inspector](doc/images/rPlayHub-windows.png)
 
@@ -49,7 +50,8 @@ The Windows client, with native desktop menus and live mirroring:
 - The phone paired and trusted with the computer once (the usual "Trust This Computer" prompt).
 - **Developer Mode** on, and Apple's **Developer Disk Image**. The engine mounts the image itself
   after every phone reboot; on a Mac with Xcode it finds the files already, and on **Linux** you
-  download them once with `./scripts/fetch-ddi.sh`. See **[doc/DDI.md](doc/DDI.md)**.
+  download them once with `./scripts/fetch-ddi.sh` (on **Windows**, `scripts/fetch-ddi.ps1`, or the
+  installer's Start-menu entry). See **[doc/DDI.md](doc/DDI.md)**.
 
 **On an older iPhone?** Use **rPlay**, the project rPlayHub belongs to. rPlay mirrors **every iOS
 version**, over **USB or wireless**, and controls the phone over **Bluetooth**.
@@ -60,10 +62,12 @@ version**, over **USB or wireless**, and controls the phone over **Bluetooth**.
 |---|---|
 | **macOS 14+** (Apple silicon) | [rPlayHub 0.1.1](https://github.com/rPlayAI/rPlayHub/releases/tag/v0.1.1) — signed and notarized DMG; open it and drag rPlayHub to Applications |
 | **Linux x86_64** (Ubuntu 22.04+, Debian 12+) | [rPlayHub for Linux 0.1.3](https://github.com/rPlayAI/rPlayHub/releases/tag/linux-v0.1.3) — `.deb`; `sudo apt install ./rplayhub_0.1.3-1_amd64.deb`, then see [doc/LINUX.md](doc/LINUX.md) |
+| **Windows 10/11 x64** | **No release yet.** Building: the installer and a portable zip are produced by CI (`windows` workflow artifacts), unsigned and **not yet tested against a phone**; see [doc/WINDOWS.md](doc/WINDOWS.md) |
 
 The app talks to a small engine (`cdhost`). On macOS the app starts it for you, and building it
 from source is covered in [BUILD.md](BUILD.md). On Linux the package installs both, and
-[doc/LINUX.md](doc/LINUX.md) is the install, run and build guide.
+[doc/LINUX.md](doc/LINUX.md) is the install, run and build guide. On Windows the GUI starts the engine
+itself as well; [doc/WINDOWS.md](doc/WINDOWS.md) is the guide.
 
 ## Platforms
 
@@ -72,7 +76,7 @@ from source is covered in [BUILD.md](BUILD.md). On Linux the package installs bo
 | **macOS** | Swift + AppKit, VideoToolbox — **shipping** (notarized DMG) |
 | **Linux** | the same C engine, FFmpeg decode, SDL2 + Dear ImGui (`client-c/`) — **shipping** (`.deb`, see [doc/LINUX.md](doc/LINUX.md)); built in CI on every push |
 | **Raspberry Pi** | the Linux client on arm64 — **next**, with the Pi's hardware decoder |
-| **Windows** | the same engine over Winsock, FFmpeg or Media Foundation decode — **upcoming** |
+| **Windows** | the same engine (userspace TCP/IP, no driver, no admin) and the Linux GUI, FFmpeg decode, built with MSYS2 — **building**: per-user installer and portable zip from CI, **not yet tested against a phone** (see [doc/WINDOWS.md](doc/WINDOWS.md)) |
 
 The engine (`host-c/`, `core/`) is portable C; what is platform-bound is the tunnel interface,
 video decode and the window shell. `app/PORTING.md` has the seams.

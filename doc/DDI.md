@@ -14,6 +14,7 @@ this repository**. This page is how to get them.
 |---|---|
 | Mac with **Xcode or Device Hub** installed | Nothing. The engine uses Xcode's copy in `/Library/Developer/DeveloperDiskImages/iOS_DDI`. |
 | **Linux**, or a Mac **without Xcode** | Download the files once, below. |
+| **Windows** | Download the files once: [Windows](#windows). |
 | Phone already connected to a Mac running Xcode or Device Hub **since its last reboot** | Nothing for now: the image is already mounted. You will need the files after the next reboot. |
 
 ## Download
@@ -42,10 +43,30 @@ curl -fLO $base/Image.dmg
 curl -fLO $base/Image.dmg.trustcache
 ```
 
+### Windows
+
+The installer adds a Start-menu entry, **rPlayHub → Fetch Developer Disk Image**, which runs
+`fetch-ddi.ps1` from the install folder. From a clone of the repository it is:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\fetch-ddi.ps1
+```
+
+It downloads the same three files from the same mirror as `fetch-ddi.sh`, into
+`%LOCALAPPDATA%\rplayhub\iOS_DDI\Restore\`. The engine looks there by itself, and the GUI also
+passes that folder to the engine as `RPLAY_DDI` when it exists. `fetch-ddi.ps1 D:\some\dir`
+downloads elsewhere; then set `RPLAY_DDI=D:\some\dir` for the engine. `DDI_REF` (or `-Ref`) picks
+a branch, tag or commit of the mirror, as for the shell script.
+
+The script has been run on Windows 11 (PowerShell 5.1) and fetched build 27A5228h. That the
+engine then mounts the image on a phone has **not** been tested on Windows yet: the mount needs a
+phone attached through Apple Mobile Device Service, and no Windows run has had one.
+
 ### From a Mac with Xcode
 
 Copy the whole folder `/Library/Developer/DeveloperDiskImages/iOS_DDI` to the other machine, and
-either put it at `~/.local/share/rplayhub/iOS_DDI` or point the engine at it:
+either put it at `~/.local/share/rplayhub/iOS_DDI` (on Windows, `%LOCALAPPDATA%\rplayhub\iOS_DDI`)
+or point the engine at it:
 
 ```sh
 RPLAY_DDI=/path/to/iOS_DDI ./host-c/cdhost
@@ -78,7 +99,7 @@ In the engine's output, under `Layer 3c: developer disk image`:
 | `already mounted` | Nothing to do. |
 | `mounted (no Xcode/Device Hub needed)` | The engine mounted it. |
 | `the device is locked -- unlock it, then reconnect` | Unlock the phone and restart the engine. |
-| `no DDI files: run scripts/fetch-ddi.sh ...` | The files were not found. See [Download](#download). |
+| `no DDI files: run scripts/fetch-ddi.sh ...` | The files were not found. See [Download](#download) (on Windows, [Windows](#windows)). |
 | `could not mount the DDI (rc=-4)` | Apple's signing server could not be reached, or refused. Check the internet connection. |
 
 ## Newer iOS versions

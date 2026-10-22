@@ -1,0 +1,70 @@
+# Windows CI -- the whole Windows build, the way a release is made: MSYS2 UCRT64, the RVRA-patched
+# FFmpeg, the engine and the GUI via scripts/build-windows.sh, a start test of the staged folder
+# with no MSYS2 on PATH (catches a DLL that was not bundled), the core tests, a smoke run of the
+# engine with no device and no Apple Mobile Device Service, then the installer and the portable
+# zip as artifacts.
+#
+# What this cannot check: anything that needs a phone. Nothing here talks to an iPhone.
+name: windows
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      # Before checkout: keep git from rewriting the shell scripts and the patch to CRLF, which
+      # bash and patch both reject.
+      - run: git config --global core.autocrlf false
+        shell: pwsh
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            make diffutils patch tar xz git curl zip
+          pacboy: >-
+            gcc:p make:p pkgconf:p SDL2:p zlib:p openssl:p nasm:p nsis:p python:p
+            libimobiledevice:p libimobiledevice-glue:p libplist:p libusbmuxd:p
+      - name: cache RVRA ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: deps/ffmpeg
+          key: ffmpeg-rvra-ucrt64-${{ hashFiles('patches/ffmpeg-rvra.patch', 'scripts/build-ffmpeg-rvra.sh') }}
+      - name: cache gui deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/imgui
+            deps/json
+          key: gui-${{ hashFiles('scripts/fetch-gui-deps.sh') }}
+      # Builds FFmpeg (unless cached), lwIP, the engine and the GUI, stages build/windows/rPlayHub
+      # and starts both staged executables with PATH reduced to C:\Windows\System32.
+      - name: build (scripts/build-windows.sh)
+        run: RPLAYHUB_SKIP_PACMAN=1 JOBS=4 ./scripts/build-windows.sh
+      # The core tests byte-compare the C against the Python reference modules (passes under
+      # MSYS2 UCRT64 locally). The capture-based RTP comparison skips itself: the captures are not
+      # in the repository.
+      - name: core tests
+        run: make -C core test
+      # No device and no Apple Mobile Device Service on the runner: the engine must start, say
+      # that usbmuxd is not there, and keep serving its API -- not crash. timeout stops it.
+      - name: smoke-run the staged engine (no device, no usbmuxd)
+        run: |
+          set -u
+          timeout 10 ./build/windows/rPlayHub/cdhost.exe 2>&1 | tee run.out || true
+          grep -qi "usbmux" run.out
+      - name: package (installer + portable zip)
+        run: ./scripts/package-windows.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rplayhub-windows
+          path: |
+            build/windows/rPlayHub-*-setup-x64.exe
+            build/windows/rPlayHub-*-windows-x64.zip
