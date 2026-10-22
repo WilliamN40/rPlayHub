@@ -1,6 +1,42 @@
 # Windows: feasibility and plan
 
-## Status, 2026-10-22 (end of day) — phases 0–5 implemented, phone run pending
+## Status, 2026-10-22 — live mirroring works on Windows with a real iPhone
+
+Verified on Windows 11 with an iPhone19,7 (iOS 27.0.1, build 24A446) over USB:
+
+- **Apple Devices (Microsoft Store) alone is enough:** `AppleMobileDeviceProcess` serves usbmux
+  on `127.0.0.1:27015`. iTunes is not needed (unknown 1 answered).
+- **Trust and pairing work through Apple's Windows service** (unknown 2 answered). Lockdown
+  failures now say what to do (locked, Trust pending, Trust declined).
+- **Developer Mode:** the switch is hidden until a developer tool asks. The engine now asks itself
+  (`com.apple.amfi.lockdown` action 0) and tells the user where to turn it on.
+- **DDI:** the personalized DDI (27A5228h, and even Xcode 27.1's) has no identity for chip 0x8160.
+  Apple's TSS refuses a borrowed one with "This device isn't eligible for the requested build".
+  The **Cryptex DDI installed through cryptexd** works. RSD went from 64 services to 85. See
+  `doc/DDI.md`.
+- **Live video, audio, Info tab:** working. The phone's tiers are 1328×2896, 1088×1920 and
+  720×1280, and its screen is 1320×2868.
+- **Two decoder bugs fixed on the way:**
+  - The trailer matcher only knew the iPhone 13 Pro's sizes.
+  - Any matcher on the escaped bytes misses 720×1280, because `0x0500` ends in a zero and
+    emulation prevention moves the `03`. The tail is now unescaped before matching
+    (patch, `stream-core.c`, `rplay-view.c`).
+- **Resolution downshifts were mostly ours.** Same phone, fast scrolling, comparable motion
+  (39–41 frames over 20 KB per 15 s):
+
+  | Request | Full resolution | Frames / 15 s |
+  |---|---|---|
+  | 60 fps, RCTL on (the earlier Windows default) | 42% | 290 |
+  | 30 fps, RCTL on | 55% | 471 |
+  | 30 fps, RCTL off | 93–99% | 633–854 |
+
+  The Windows GUI now defaults to `RPLAY_FPS=30` and `RPLAY_RCTL=0`. This is very likely the
+  cause of AGENTS.md's "our sessions downshift far more than Device Hub's" on every platform,
+  but it has only been measured on this phone.
+- **Touch** is now streamed live: a `touch` API method (down/move/up) over one persistent HID
+  channel, instead of a whole tap or swipe sent on release over a fresh connection each time.
+
+## Status, 2026-10-22 (earlier) — phases 0–5 implemented, phone run pending
 
 Done and checked on Windows 11 without a phone:
 

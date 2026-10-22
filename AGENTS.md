@@ -109,6 +109,16 @@ and still serves the same contract, but the app is developed against the C one.
   fallback plan is viable at all (a freeze half the time is not a product), so it is the more
   promising thread than the bitrate ceiling. Confounded by motion; the new instrument controls for
   it. `python3 scripts/rvra-bitrate.py --self-test <capture.h265>` reproduces the table.
+  **Likely answered 2026-10-22 (Windows, iPhone19,7): our RCTL messages cause it.** With comparable
+  motion, RCTL on gave 42–55% of frames at full tier, and `RPLAY_RCTL=0` gave 93–99%. Asking for
+  60 fps instead of 30 made it worse again, because the encoder sheds resolution for an
+  unreachable frame rate. The Windows GUI now defaults to 30 fps with no RCTL. This is not yet
+  re-measured on macOS/Linux or another phone; that is the next thing to run there.
+  `doc/WINDOWS-PLAN.md` has the table.
+- **Windows: live mirroring verified on a real phone (2026-10-22)** — iPhone19,7 over USB via the
+  Apple Devices app, with Developer Mode revealed by the engine and the **Cryptex DDI via
+  cryptexd**, because the personalized DDI has no identity for chip 0x8160. `doc/WINDOWS.md`,
+  `doc/DDI.md`.
 - **Rotate turns the VIEW, not the device.** Verified against the full service catalogue: there is
   no orientation, accelerometer or motion service. Nothing advertised can rotate a physical device.
 - Lock / volume / Siri: **refused, not faked.** They need the `mainScreenButtons` HID report format
