@@ -153,15 +153,24 @@ cp deps/ffmpeg/COPYING.LGPLv2.1            "$L/LGPL-2.1.txt"
 cp deps/ffmpeg/LICENSE.md                  "$L/FFmpeg-LICENSE.md"
 cp deps/imgui/LICENSE.txt                  "$L/imgui-LICENSE.txt"
 cp deps/lwip/COPYING                       "$L/lwIP-COPYING.txt"
-cp "$M/SDL2/LICENSE.txt"                   "$L/SDL2-LICENSE.txt"
-cp "$M/openssl/LICENSE"                    "$L/OpenSSL-LICENSE.txt"
-cp "$M/zlib/LICENSE"                       "$L/zlib-LICENSE.txt"
-cp "$M/winpthreads/COPYING"                "$L/winpthreads-COPYING.txt" 2>/dev/null \
-    || cp "$M/libwinpthread/COPYING"       "$L/winpthreads-COPYING.txt"
-cp "$M/crt/COPYING.MinGW-w64-runtime.txt"  "$L/MinGW-w64-runtime.txt"
-cp "$M/crt/COPYING.MinGW-w64.txt"          "$L/MinGW-w64.txt"
-cp "$M/gcc-libs/COPYING.RUNTIME"           "$L/GCC-RUNTIME-EXCEPTION.txt"
-cp "$M/gcc-libs/COPYING3"                  "$L/GCC-RUNTIME-GPL-3.0.txt"
+# MSYS2 packages move their licence files between releases (the CI runner's gcc-libs had no
+# COPYING.RUNTIME where this machine's did), so each is looked up: the listed paths first, then
+# any file of that name under $M; a miss is reported loudly but does not stop the build.
+lic() {   # lic <dest name> <file name> <candidate path>...
+    local dest=$1 name=$2; shift 2
+    local f
+    for f in "$@"; do [ -f "$M/$f" ] && { cp "$M/$f" "$L/$dest"; return; }; done
+    f="$(find "$M" -name "$name" -type f 2>/dev/null | head -1)"
+    if [ -n "$f" ]; then cp "$f" "$L/$dest"; else echo "WARNING: licence $name not found for $dest" >&2; fi
+}
+lic SDL2-LICENSE.txt              LICENSE.txt                    SDL2/LICENSE.txt
+lic OpenSSL-LICENSE.txt           LICENSE                        openssl/LICENSE openssl/LICENSE.txt
+lic zlib-LICENSE.txt              LICENSE                        zlib/LICENSE
+lic winpthreads-COPYING.txt       COPYING                        winpthreads/COPYING libwinpthread/COPYING
+lic MinGW-w64-runtime.txt         COPYING.MinGW-w64-runtime.txt  crt/COPYING.MinGW-w64-runtime.txt
+lic MinGW-w64.txt                 COPYING.MinGW-w64.txt          crt/COPYING.MinGW-w64.txt
+lic GCC-RUNTIME-EXCEPTION.txt     COPYING.RUNTIME                gcc-libs/COPYING.RUNTIME gcc/COPYING.RUNTIME
+lic GCC-RUNTIME-GPL-3.0.txt       COPYING3                       gcc-libs/COPYING3 gcc/COPYING3
 cat > "$L/MIT-nlohmann-json.txt" <<'MIT'
 MIT License
 
