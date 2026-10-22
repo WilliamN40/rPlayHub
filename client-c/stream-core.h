@@ -49,14 +49,24 @@ typedef struct {
     AVFrame        *frame;
     void (*on_frame)(AVFrame *f, int active_w, int active_h);
     uint64_t frames_decoded, decode_errors;
+
+    int      codec_checked;      /* the bitstream's codec has been sniffed (see sniff_codec) */
+    uint64_t codec_switches;     /* times the advertised codec was overruled by the bitstream */
 } stream_state;
 
+/* Parameter sets and prefix SEI are held and submitted with the slices that follow them. If the
+ * first parameter set contradicts g_h264, handle_nal reopens s->dec for the real codec (copying
+ * its thread_count/flags) and updates g_h264. */
 void handle_nal(void *ctx, const uint8_t *nal, size_t len);
+/* Submit the pending access unit. A no-op while it holds no slice. */
 void flush_au(stream_state *s);
+/* 1 = HEVC, 0 = H.264, -1 = undecidable from this NAL (only parameter sets are judged). */
+int sniff_codec(const uint8_t *nal, size_t len);
 
 /* ---- transport helpers. */
 int tcp_connect(const char *host, int port);
 int stream_says_h264(const char *host, int api_port);
+int reply_says_h264(const char *reply);   /* stream_info reply -> 1 if the codec is H.264 */
 
 #ifdef __cplusplus
 }

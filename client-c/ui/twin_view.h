@@ -49,6 +49,14 @@ public:
                 ImTextureID outer_tex = 0, SDL_Renderer* renderer = nullptr,
                 int outer_rotation = 0);
 
+    // The visible part of the screen texture, as UV maxima: the coded frame is the screen plus
+    // 16-pixel alignment padding (or, on a reduced RVRA tier, a squeezed picture in its top-left),
+    // so only [0..u_max]x[0..v_max] is picture. Applies to the screen_tex passed to render() and
+    // nothing else (test grid, back art). Default 1x1: the whole texture.
+    void setScreenCrop(float u_max, float v_max);
+
+    // out_x/out_y are in display_w x display_h space (the render() arguments), i.e. over the
+    // VISIBLE screen once a crop is set -- divide by those for the fractions the device wants.
     bool hitTest(ImVec2 mouse, int& out_x, int& out_y) const;
 
 private:
@@ -112,6 +120,11 @@ private:
     float body_w_ = 0.0f, body_h_ = 0.0f, body_d_ = 0.0f;
     float panel_w_ = 0.0f, panel_h_ = 0.0f, half_w_ = 0.0f, shift_x_ = 0.0f;
     int display_w_ = 0, display_h_ = 0, rotation_ = 0;
+
+    // Screen crop (see setScreenCrop) and the texture it applies to, as passed to render().
+    ImVec2 crop_{1.0f, 1.0f};
+    ImTextureID live_tex_ = 0;
+    ImVec2 screenUV(ImTextureID tex, float u, float v, int quadrants) const;
 };
 
 } // namespace rplayhub

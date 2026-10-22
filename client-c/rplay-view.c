@@ -135,7 +135,26 @@ static int nal_type(const uint8_t *nal)      { return g_h264 ? (nal[0] & 0x1F) :
 static int is_param_set(int t)               { return g_h264 ? (t == 7 || t == 8) : (t >= 32 && t <= 34); }
 static int is_vcl(int t)                     { return g_h264 ? (t >= 1 && t <= 5) : t < 32; }
 static int is_keyframe(int t)                { return g_h264 ? t == 5 : (t >= 16 && t <= 23); }
+/* Prefix SEI belongs to the access unit that follows it; HEVC suffix SEI (40) would land after the
+ * RVRA trailer, so it stays dropped. */
+static int is_prefix_sei(int t)              { return g_h264 ? (t == 6) : (t == 39); }
 static int header_len(void)                  { return g_h264 ? 1 : 2; }
+
+/* What the bitstream says it is: 1 = HEVC, 0 = H.264, -1 = undecidable from this NAL. Only
+ * parameter-set patterns the other codec cannot produce count (same rule as stream-core.c). */
+static int sniff_codec(const uint8_t *nal, size_t len)
+{
+    if (len < 3) return -1;
+    if ((nal[0] == 0x40 || nal[0] == 0x42 || nal[0] == 0x44) && nal[1] == 0x01) return 1;
+    if (!(nal[0] & 0x80) && (nal[0] & 0x1F) == 7) {
+        switch (nal[1]) {   /* profile_idc */
+        case 66: case 77: case 88: case 100: case 110: case 122: case 244: case 44:
+        case 83: case 86: case 118: case 128: case 138: case 139: case 134: case 135:
+            return 0;
+        }
+    }
+    return -1;
+}
 
 /* ------------------------------------------------------------------ active-rect trailer
  *
@@ -191,6 +210,8 @@ typedef struct {
     AVCodecContext *dec;
     void (*on_frame)(AVFrame *f, int active_w, int active_h);
     uint64_t frames_decoded, decode_errors;
+    int      codec_checked;      /* the bitstream's own codec has been sniffed */
+    int      codec_forced;       /* --codec given: trust it, do not sniff */
 } stream_state;
 
 static void au_append(stream_state *s, const uint8_t *nal, size_t len)
@@ -231,7 +252,9 @@ static void decode_au(stream_state *s, const uint8_t *data, size_t len)
 
 static void flush_au(stream_state *s)
 {
-    if (!s->au_len) return;
+    /* Parameter sets / SEI with no slice yet: keep them for the picture they precede. Submitted
+     * alone they are not a frame (H.264 reports "no frame!" as an error). */
+    if (!s->au_len || !s->last_vcl_len) return;
 
     /* Read the active size off the trailer — the only signal that the encoder downshifted —
      * but leave the bytes in place: the RVRA-patched decoder finds the trailer on the packet
@@ -246,26 +269,57 @@ static void flush_au(stream_state *s)
             s->active_h = h;
         }
     }
-    if (s->last_vcl_len) s->frames_submitted++;   /* parameter-set-only packets are not frames */
+    s->frames_submitted++;
     decode_au(s, s->au, s->au_len);
     s->au_len = 0;
     s->last_vcl_len = 0;
 }
 
+/* stream_info and the bitstream disagree: reopen the decoder for what is actually arriving. */
+static void switch_codec(stream_state *s, int h264)
+{
+    const AVCodec *codec = avcodec_find_decoder(h264 ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC);
+    if (!codec) { fprintf(stderr, "bitstream is %s, which this libavcodec cannot decode\n", h264 ? "h264" : "hevc"); return; }
+    fprintf(stderr, "stream advertised %s but the bitstream is %s -- switching decoder\n",
+            g_h264 ? "h264" : "hevc", h264 ? "h264" : "hevc");
+    if (!h264) setenv("RPLAY_RVRA", "1", 0);
+    AVCodecContext *n = avcodec_alloc_context3(codec);
+    if (!n) return;
+    n->thread_count = s->dec ? s->dec->thread_count : 1;
+    if (avcodec_open2(n, codec, NULL) != 0) { avcodec_free_context(&n); return; }
+    avcodec_free_context(&s->dec);
+    s->dec = n;
+    g_h264 = h264;
+    s->au_len = 0;
+    s->last_vcl_len = 0;
+    s->awaiting_keyframe = 1;
+}
+
 static void handle_nal(void *ctx, const uint8_t *nal, size_t len)
 {
     stream_state *s = ctx;
+    if (!s->codec_checked && !s->codec_forced) {
+        int hevc = sniff_codec(nal, len);
+        if (hevc >= 0) {
+            s->codec_checked = 1;
+            if (hevc == g_h264) switch_codec(s, !hevc);
+        }
+    }
     if (len <= (size_t)header_len()) return;
     s->nals++;
     s->last_nal_ms = now_ms();
     int t = nal_type(nal);
 
-    if (is_param_set(t)) {
-        flush_au(s);
+    /* Parameter sets and prefix SEI open the NEXT access unit: they end a pending picture, then
+     * travel in the same packet as the slices that follow, so the last slice (and its RVRA
+     * trailer) stays the packet tail. */
+    if (is_param_set(t) || is_prefix_sei(t)) {
+        if (s->last_vcl_len) flush_au(s);
+        if (!s->last_vcl_len && s->au_len > (1u << 20)) s->au_len = 0;   /* no picture ever came */
         au_append(s, nal, len);   /* in-band is fine: libavcodec picks parameter sets out of the packet */
         return;
     }
-    if (!is_vcl(t)) return;       /* SEI, AUD, end-of-sequence — nothing to display */
+    if (!is_vcl(t)) return;       /* suffix SEI, AUD, end-of-sequence — nothing to display */
 
     int first_slice = (nal[header_len()] & 0x80) != 0;
     if (first_slice) flush_au(s);
@@ -500,9 +554,27 @@ static int tcp_connect(const char *host, int port)
     return fd;
 }
 
+/* "codec" out of a stream_info reply, whitespace-tolerant: cdhost writes "codec":"hevc",
+ * mirror.py (json.dumps) writes "codec": "h264". */
+static int reply_says_h264(const char *reply)
+{
+    for (const char *p = reply; (p = strstr(p, "\"codec\"")) != NULL; ) {
+        p += 7;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p != ':') continue;
+        p++;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p != '"') continue;
+        p++;
+        return !strncmp(p, "h264\"", 5) || !strncmp(p, "H264\"", 5) || !strncmp(p, "avc\"", 4) ||
+               !strncmp(p, "h.264\"", 6) || !strncmp(p, "H.264\"", 6);
+    }
+    return 0;
+}
+
 /* Ask 9876 which codec the device negotiated. Best effort: on any failure the answer is "hevc",
- * which is what the device picks when offered both. One line of JSON out, one line back; the
- * value is found with strstr because the reply is our own engine's flat JSON, not the internet's. */
+ * which is what the device picks when offered both. One line of JSON out, one line back. Only
+ * advisory: handle_nal checks it against the bitstream's own parameter sets. */
 static int stream_says_h264(const char *host, int api_port)
 {
     int fd = tcp_connect(host, api_port);
@@ -520,7 +592,7 @@ static int stream_says_h264(const char *host, int api_port)
     }
     close(fd);
     reply[got > 0 ? got : 0] = 0;
-    return strstr(reply, "\"codec\":\"h264\"") != NULL;
+    return reply_says_h264(reply);
 }
 
 /* ------------------------------------------------------------------ main */
@@ -557,6 +629,7 @@ int main(int argc, char **argv)
 
     stream_state s = { 0 };
     s.awaiting_keyframe = 1;
+    s.codec_forced = codec_arg != NULL;
     if (dump_path) {
         g_dump = fopen(dump_path, "wb");
         if (!g_dump) { fprintf(stderr, "%s: %s\n", dump_path, strerror(errno)); return 1; }

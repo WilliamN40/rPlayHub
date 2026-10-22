@@ -9,21 +9,54 @@
 # Needs: pkg-config, SDL2 (and, for the fallback, system libavcodec/libavutil).
 #   macOS:  brew install ffmpeg sdl2
 #   Debian: apt install libavcodec-dev libavutil-dev libsdl2-dev
+#
+# Windows: MSYS2 UCRT64 (gcc/g++, make, pkgconf, SDL2, zlib). Build from a real MSYS2 shell, not
+# Git Bash, which mangles /ucrt64 paths:
+#   MSYSTEM=UCRT64 CHERE_INVOKING=1 /c/msys64/usr/bin/bash -lc 'make -C client-c rplay-gui'
+# produces client-c/rplay-gui.exe: one fully static, GUI-subsystem executable (SDL2, FFmpeg,
+# libstdc++, winpthread all linked in), with the icon, version info and application manifest from
+# rplay-gui.rc. rplay-view is not ported to Windows.
 
 FFMPEG_DIR ?= ../deps/ffmpeg
 
 # The Linux client's version: what scripts/package-deb.sh stamps on the .deb and the release tag
-# (linux-v<version>) carries. Independent of the macOS app's MARKETING_VERSION.
+# (linux-v<version>) carries. Independent of the macOS app's MARKETING_VERSION. The Windows build
+# stamps it into rplay-gui.exe's version resource too.
 RPLAYHUB_VERSION := 0.1.3
 
+ifeq ($(OS),Windows_NT)
+  WINDOWS := 1
+else ifneq ($(filter MINGW% MSYS%,$(shell uname -s 2>/dev/null)),)
+  WINDOWS := 1
+endif
+
 CFLAGS += -Wall -Wextra -O2
-LIBS   := $(shell pkg-config --libs sdl2)
+ifdef WINDOWS
+  EXE     := .exe
+  WINDRES ?= windres
+  # Lean windows.h everywhere, so <SDL_syswm.h> (which includes it) does not drag in winsock.h
+  # ahead of the <winsock2.h> the sources use.
+  CFLAGS  += -DWIN32_LEAN_AND_MEAN -DNOMINMAX
+  # --static: SDL2's own system dependencies, for linking libSDL2.a rather than SDL2.dll.
+  LIBS    := $(shell pkg-config --static --libs sdl2)
+else
+  LIBS    := $(shell pkg-config --libs sdl2)
+endif
 
 ifneq ($(wildcard $(FFMPEG_DIR)/libavcodec/libavcodec.a),)
   # The patched tree FIRST, before SDL's pkg-config flags drag in /opt/homebrew/include --
   # the system ffmpeg headers live there too, and silently shadowing the patched ones with
   # them only works while the two versions happen to match.
-  CFLAGS += -I$(FFMPEG_DIR)
+  ifdef WINDOWS
+    # Not -I on the tree itself: its top level holds files named VERSION, RELEASE, ... and on a
+    # case-insensitive filesystem C++'s <version> resolves to ffmpeg's VERSION. Stage just the
+    # public headers (rule below) and point -I at those.
+    FFINC  := .build/ffmpeg-include
+    FF_HDR_STAMP := $(FFINC)/.stamp
+    CFLAGS += -I$(FFINC)
+  else
+    CFLAGS += -I$(FFMPEG_DIR)
+  endif
   # -lz: the patched tree is configured --enable-zlib so libavcodec has the PNG decoder the GUI
   # uses for app icons.
   LIBS   += $(FFMPEG_DIR)/libavcodec/libavcodec.a $(FFMPEG_DIR)/libswresample/libswresample.a \
@@ -35,8 +68,15 @@ else
 endif
 CFLAGS += $(shell pkg-config --cflags sdl2)
 
+ifdef WINDOWS
+# Not ported (POSIX sockets throughout); the GUI is the Windows client.
+.DEFAULT_GOAL := rplay-gui
+rplay-view:
+	@echo "rplay-view is not ported to Windows -- build rplay-gui instead." >&2; exit 1
+else
 rplay-view: rplay-view.c
 	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+endif
 
 # The full GUI (mirror pane + inspector tabs) — a SEPARATE app: Dear ImGui over the same SDL2
 # renderer. rplay-view stays the untouched minimal reference viewer; stream-core.c is the GUI's
@@ -58,19 +98,53 @@ else
   GUI_LIBS += $(shell pkg-config --libs libswscale 2>/dev/null)
 endif
 
-CXXFLAGS += $(CFLAGS) -std=c++17 -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends -I../deps/json -Iui
+CXXFLAGS += $(CFLAGS) -std=c++17 -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends -I../deps/json -Iui \
+            -DRPLAYHUB_VERSION=\"$(RPLAYHUB_VERSION)\"
 
 ifeq ($(shell pkg-config --exists x11 xext gl 2>/dev/null && echo 1),1)
   CXXFLAGS += -DRPLAYHUB_HAVE_X11 $(shell pkg-config --cflags x11 xext gl)
   GUI_LIBS += $(shell pkg-config --libs x11 xext gl)
 endif
 
-rplay-gui: rplay-gui.cpp $(UI_SRC) $(UI_HDR) stream-core.c stream-core.h audio.c audio.h
+GUI_BIN  := rplay-gui$(EXE)
+GUI_DEPS := rplay-gui.cpp $(UI_SRC) $(UI_HDR) stream-core.c stream-core.h audio.c audio.h
+GUI_RES  :=
+
+ifdef WINDOWS
+  # Everything static (-static also picks libSDL2.a over SDL2.dll), so the exe runs anywhere with
+  # no DLLs beside it. -mwindows (from sdl2's pkg-config) makes it a GUI-subsystem app with no
+  # console; rplay-gui attaches to the parent console or logs to %LOCALAPPDATA%\rplayhub instead.
+  GUI_LDFLAGS := -static -static-libgcc -static-libstdc++ -s
+  GUI_LIBS    += -ldwmapi -lws2_32 -lcomdlg32 -lshell32 -lole32 -loleaut32 -luser32 -lgdi32 \
+                 -lwinmm -limm32 -lversion -lsetupapi -luuid -lbcrypt -lsecur32 -ladvapi32
+  GUI_RES     := rplay-gui.res.o
+  VER_WORDS   := $(subst ., ,$(RPLAYHUB_VERSION))
+
+$(GUI_RES): rplay-gui.rc rplay-gui.manifest rplay-gui.ico
+	$(WINDRES) -DRPLAYHUB_VER_MAJOR=$(word 1,$(VER_WORDS)) -DRPLAYHUB_VER_MINOR=$(word 2,$(VER_WORDS)) \
+	    -DRPLAYHUB_VER_PATCH=$(word 3,$(VER_WORDS)) -O coff -i rplay-gui.rc -o $@
+
+# `make rplay-gui` keeps working on Windows, where the file is rplay-gui.exe.
+rplay-gui: $(GUI_BIN)
+.PHONY: rplay-gui
+endif
+
+ifdef FF_HDR_STAMP
+$(FF_HDR_STAMP): $(FFMPEG_DIR)/libavcodec/libavcodec.a
+	rm -rf $(FFINC) && mkdir -p $(FFINC)
+	cd $(FFMPEG_DIR) && find libavcodec libavutil libswscale libswresample -name '*.h' \
+	    -exec cp --parents {} $(abspath $(FFINC)) \;
+	touch $@
+endif
+
+$(GUI_BIN): $(GUI_DEPS) $(GUI_RES) $(FF_HDR_STAMP)
 	$(CC) $(CFLAGS) -c stream-core.c -o stream-core.o
 	$(CC) $(CFLAGS) -c audio.c -o audio.o
-	$(CXX) $(CXXFLAGS) -o $@ rplay-gui.cpp $(UI_SRC) stream-core.o audio.o $(IMGUI_SRC) $(GUI_LIBS)
+	$(CXX) $(CXXFLAGS) -o $@ rplay-gui.cpp $(UI_SRC) stream-core.o audio.o $(IMGUI_SRC) $(GUI_RES) \
+	    $(GUI_LDFLAGS) $(GUI_LIBS)
 
 clean:
-	rm -f rplay-view rplay-gui stream-core.o audio.o
+	rm -f rplay-view rplay-gui rplay-gui.exe rplay-gui.res.o stream-core.o audio.o
+	rm -rf .build
 
 .PHONY: clean

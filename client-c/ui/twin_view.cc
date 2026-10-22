@@ -351,10 +351,10 @@ void TwinView::addOrbit(float dyaw, float dpitch) {
 
 std::string TwinView::referencePath() {
 #ifdef _WIN32
-    const char* home = std::getenv("USERPROFILE");
-    if (!home) home = std::getenv("APPDATA");
-    std::string dir = std::string(home ? home : ".") + "/.config/rplayhub-android";
-    _mkdir((std::string(home ? home : ".") + "/.config").c_str());
+    // Roaming settings belong in %APPDATA%\rplayhub, not a Unix-style dot folder in the profile.
+    const char* appdata = std::getenv("APPDATA");
+    if (!appdata || !*appdata) appdata = std::getenv("USERPROFILE");
+    std::string dir = std::string(appdata && *appdata ? appdata : ".") + "\\rplayhub";
     _mkdir(dir.c_str());
 #else
     const char* home = std::getenv("HOME");
@@ -549,9 +549,25 @@ static ImVec2 applyPanelTransform(float u, float v, int quadrants) {
     }
 }
 
+void TwinView::setScreenCrop(float u_max, float v_max) {
+    crop_ = ImVec2(std::clamp(u_max, 0.01f, 1.0f), std::clamp(v_max, 0.01f, 1.0f));
+}
+
+// Panel (u, v) -> texture UV: the rotation counter-turn, then the crop when `tex` is the live
+// screen texture.
+ImVec2 TwinView::screenUV(ImTextureID tex, float u, float v, int quadrants) const {
+    ImVec2 uv = applyPanelTransform(u, v, quadrants);
+    if (tex && tex == live_tex_) {
+        uv.x *= crop_.x;
+        uv.y *= crop_.y;
+    }
+    return uv;
+}
+
 void TwinView::render(ImDrawList* dl, ImVec2 origin, ImVec2 size, ImTextureID screen_tex, ImTextureID back_tex,
                       int display_w, int display_h, int rotation, float scale,
                       ImTextureID outer_tex, SDL_Renderer* renderer, int outer_rotation) {
+    live_tex_ = screen_tex;   // before any test-grid substitution: the crop is the live picture's
     const auto now = std::chrono::steady_clock::now();
     const float dt = last_tick_.time_since_epoch().count() == 0
                    ? (1.0f / 60.0f)
@@ -948,10 +964,10 @@ void TwinView::render(ImDrawList* dl, ImVec2 origin, ImVec2 size, ImTextureID sc
                 float v0 = static_cast<float>(j) / gy, v1 = static_cast<float>(j + 1) / gy;
                 if (screen_tex) {
                     dl->AddImageQuad(screen_tex, a, b, c, d,
-                                     applyPanelTransform(u0, v0, rotation_),
-                                     applyPanelTransform(u1, v0, rotation_),
-                                     applyPanelTransform(u1, v1, rotation_),
-                                     applyPanelTransform(u0, v1, rotation_));
+                                     screenUV(screen_tex, u0, v0, rotation_),
+                                     screenUV(screen_tex, u1, v0, rotation_),
+                                     screenUV(screen_tex, u1, v1, rotation_),
+                                     screenUV(screen_tex, u0, v1, rotation_));
                 } else {
                     dl->AddQuadFilled(a, b, c, d, IM_COL32(0, 0, 0, 255));
                 }
@@ -1499,10 +1515,11 @@ void TwinView::renderFold(ImDrawList* dl, ImVec2 size, ImTextureID screen_tex, I
                     continue;
                 }
 
-                ImVec2 uv00 = applyPanelTransform(std::clamp(v00.u, 0.0f, 1.0f), std::clamp(v00.v, 0.0f, 1.0f), tex_rot);
-                ImVec2 uv10 = applyPanelTransform(std::clamp(v10.u, 0.0f, 1.0f), std::clamp(v10.v, 0.0f, 1.0f), tex_rot);
-                ImVec2 uv11 = applyPanelTransform(std::clamp(v11.u, 0.0f, 1.0f), std::clamp(v11.v, 0.0f, 1.0f), tex_rot);
-                ImVec2 uv01 = applyPanelTransform(std::clamp(v01.u, 0.0f, 1.0f), std::clamp(v01.v, 0.0f, 1.0f), tex_rot);
+                ImVec2 uv00 = screenUV(tex, std::clamp(v00.u, 0.0f, 1.0f), std::clamp(v00.v, 0.0f, 1.0f), tex_rot);
+                ImVec2 uv10 = screenUV(tex, std::clamp(v10.u, 0.0f, 1.0f), std::clamp(v10.v, 0.0f, 1.0f), tex_rot);
+                ImVec2 uv11 = screenUV(tex, std::clamp(v11.u, 0.0f, 1.0f), std::clamp(v11.v, 0.0f, 1.0f), tex_rot);
+                ImVec2 uv01 = screenUV(tex, std::clamp(v01.u, 0.0f, 1.0f), std::clamp(v01.v, 0.0f, 1.0f), tex_rot);
+                const ImVec2 uv_hi = (tex && tex == live_tex_) ? crop_ : ImVec2(1.0f, 1.0f);
 
                 float b00 = v00.inside ? v00.bright : 0.0f;
                 float b10 = v10.inside ? v10.bright : 0.0f;
@@ -1521,8 +1538,8 @@ void TwinView::renderFold(ImDrawList* dl, ImVec2 size, ImTextureID screen_tex, I
                     for (int tap = 0; tap < 5; ++tap) {
                         ImVec2 o(kTapX[tap] * du, kTapY[tap] * dv);
                         auto shift_uv = [&](ImVec2 u) {
-                            return ImVec2(std::clamp(u.x + o.x, 0.001f, 0.999f),
-                                          std::clamp(u.y + o.y, 0.001f, 0.999f));
+                            return ImVec2(std::clamp(u.x + o.x, 0.001f, uv_hi.x - 0.001f),
+                                          std::clamp(u.y + o.y, 0.001f, uv_hi.y - 0.001f));
                         };
                         add_shaded_image_quad(
                             tex, v00.pos, v10.pos, v11.pos, v01.pos,
@@ -1653,10 +1670,10 @@ void TwinView::renderFold(ImDrawList* dl, ImVec2 size, ImTextureID screen_tex, I
                         float v0 = static_cast<float>(j) / gy, v1 = static_cast<float>(j + 1) / gy;
                         if (screen_tex) {
                             dl->AddImageQuad(screen_tex, a, b, c, d,
-                                             applyPanelTransform(u0, v0, rotation_),
-                                             applyPanelTransform(u1, v0, rotation_),
-                                             applyPanelTransform(u1, v1, rotation_),
-                                             applyPanelTransform(u0, v1, rotation_));
+                                             screenUV(screen_tex, u0, v0, rotation_),
+                                             screenUV(screen_tex, u1, v0, rotation_),
+                                             screenUV(screen_tex, u1, v1, rotation_),
+                                             screenUV(screen_tex, u0, v1, rotation_));
                         }
                     }
                 }

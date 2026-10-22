@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""Replay a recorded .h265 as if it were the live engine. No device, no root.
+"""Replay a recorded .h265 (or .h264) as if it were the live engine. No device, no root.
 
 This exists so the app can be developed and verified against real device frames without a phone
-attached and without sudo. It speaks the same two sockets as `host/mirror.py`:
+attached and without sudo. It speaks the same two sockets as `host/mirror.py` and `host-c/cdhost`:
 
-    127.0.0.1:9877   Annex-B HEVC, parameter sets first, paced to a frame rate, looping
+    127.0.0.1:9877   Annex-B video, parameter sets first, paced to a frame rate, looping
     127.0.0.1:9876   the JSON-line control API — taps and swipes are logged, not injected
 
     python3 scripts/mock_engine.py [screen3.h265] [--fps 33] [--width 1170] [--height 2532]
+                                   [--codec auto|hevc|h264] [--aud] [--advertise hevc|h264]
+
+The codec is read from the file's own parameter sets unless --codec says otherwise; stream_info
+reports it the way mirror.py does (json.dumps, so `"codec": "h264"` with a space). --aud ends
+every access unit with an Access Unit Delimiter plus a trailing start code, the framing cdhost
+uses so viewers can present a picture without waiting for the next one. list_devices answers in
+cdhost's shape (devices[] with bound/screen_width/..., usbmuxd, engine_state) and keeps the
+mirror.py fields (id, connected, transport, screen_size) the macOS app also reads.
 
 The default width/height are an iPhone 13 Pro's real screen. They deliberately differ from the
 coded video size (1184×2576) because the encoder pads to 16-pixel alignment — reproducing that
@@ -22,38 +30,89 @@ import threading
 import time
 
 ANNEXB = b"\x00\x00\x00\x01"
-VPS, SPS, PPS = 32, 33, 34
 LOGICAL_MAX = 16384
 
+# Per-codec NAL grammar. HEVC: 2-byte header, type in bits 1-6. H.264: 1-byte header, bits 0-4.
+CODECS = {
+    "hevc": {"header": 2, "type": lambda b: (b >> 1) & 0x3F, "params": (32, 33, 34),
+             "vcl": lambda t: t < 32, "key": lambda t: 16 <= t <= 23,
+             "aud": b"\x46\x01\x50", "names": {32: "VPS", 33: "SPS", 34: "PPS"}},
+    "h264": {"header": 1, "type": lambda b: b & 0x1F, "params": (7, 8),
+             "vcl": lambda t: 1 <= t <= 5, "key": lambda t: t == 5,
+             "aud": b"\x09\x10", "names": {7: "SPS", 8: "PPS"}},
+}
 
-def nal_type(nal):
-    return (nal[0] >> 1) & 0x3F if nal else -1
+
+def split_nals(data):
+    """Annex-B -> NAL payloads, on 3-byte AND 4-byte start codes.
+
+    Splitting on 00 00 00 01 alone silently dropped every NAL behind a 3-byte code — x265 writes
+    one before each slice after the first in an access unit, so the IDR went missing. A 4-byte code
+    is a 3-byte one with a zero in front, so splitting on 00 00 01 and trimming trailing zeros
+    (that zero, plus any trailing_zero_8bits) handles both."""
+    nals, i, starts = [], 0, []
+    while True:
+        j = data.find(b"\x00\x00\x01", i)
+        if j < 0:
+            break
+        starts.append(j + 3)
+        i = j + 3
+    for k, s in enumerate(starts):
+        e = starts[k + 1] - 3 if k + 1 < len(starts) else len(data)
+        nal = data[s:e].rstrip(b"\x00")
+        if nal:
+            nals.append(nal)
+    return nals
 
 
-def load_access_units(path):
+def sniff_codec(nals):
+    """What the parameter sets say: HEVC VPS/SPS/PPS headers are 40 01 / 42 01 / 44 01; an H.264
+    SPS is type 7 (with forbidden_zero_bit clear). None when the file shows neither."""
+    for n in nals:
+        if len(n) >= 2 and n[0] in (0x40, 0x42, 0x44) and n[1] == 0x01:
+            return "hevc"
+        if not (n[0] & 0x80) and (n[0] & 0x1F) == 7:
+            return "h264"
+    return None
+
+
+def load_access_units(path, codec="auto"):
     """Split the file into parameter sets and access units, the way the app expects them."""
-    data = open(path, "rb").read()
-    nals = [n for n in data.split(ANNEXB)[1:] if n]
+    nals = split_nals(open(path, "rb").read())
+    if codec == "auto":
+        codec = sniff_codec(nals) or ("h264" if path.lower().endswith((".h264", ".264", ".avc"))
+                                      else "hevc")
+    g = CODECS[codec]
+    hl = g["header"]
     params, units, current = {}, [], []
     for nal in nals:
-        t = nal_type(nal)
-        if t in (VPS, SPS, PPS):
+        if len(nal) <= hl:
+            continue
+        t = g["type"](nal[0])
+        if t in g["params"]:
             params[t] = nal
             continue
-        if t < 32:
-            # first_slice_segment_in_pic_flag — top bit after the 2-byte NAL header
-            if len(nal) >= 3 and (nal[2] & 0x80) and current:
+        if g["vcl"](t):
+            # First slice of a picture: HEVC first_slice_segment_in_pic_flag, H.264
+            # first_mb_in_slice == 0 (ue(v) '1') — both the top bit after the NAL header.
+            if (nal[hl] & 0x80) and current:
                 units.append(current)
                 current = []
             current.append(nal)
     if current:
         units.append(current)
-    return params, units
+    return codec, params, units
 
 
 class MockEngine:
-    def __init__(self, path, fps, width, height, start_at=0, burst=0):
-        self.params, self.units = load_access_units(path)
+    def __init__(self, path, fps, width, height, start_at=0, burst=0, codec="auto", aud=False,
+                 advertise=None):
+        self.codec, self.params, self.units = load_access_units(path, codec)
+        self.advertise = advertise or self.codec   # what stream_info claims
+        self.grammar = CODECS[self.codec]
+        self.aud = aud
+        self.started = time.time()
+        self.bytes_sent = 0
         self.fps = fps
         self.start_at = start_at
         self.burst = burst
@@ -65,15 +124,22 @@ class MockEngine:
         self._clients = []
         self._lock = threading.Lock()
         self.recorder = None        # mirrors the real engine's recording feature
-        missing = [n for n in (VPS, SPS, PPS) if n not in self.params]
+        names = self.grammar["names"]
+        missing = [names[n] for n in self.grammar["params"] if n not in self.params]
         if missing:
             print(f"warning: file has no {missing} parameter sets — a decoder cannot start")
-        print(f"loaded {len(self.units)} access units, "
-              f"parameter sets {sorted(self.params)} from {path}")
+        keys = sum(1 for u in self.units if any(self.grammar["key"](self._type(n)) for n in u))
+        print(f"loaded {len(self.units)} {self.codec.upper()} access units ({keys} with a keyframe), "
+              f"parameter sets {[names[t] for t in sorted(self.params)]} from {path}")
+        if not keys:
+            print("warning: no keyframe in the file — a viewer will never decode anything")
+
+    def _type(self, nal):
+        return self.grammar["type"](nal[0]) if nal else -1
 
     # ---------------- video ----------------
     def _preamble(self):
-        return b"".join(ANNEXB + self.params[t] for t in (VPS, SPS, PPS) if t in self.params)
+        return b"".join(ANNEXB + self.params[t] for t in self.grammar["params"] if t in self.params)
 
     def serve_video(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -118,6 +184,10 @@ class MockEngine:
             # Re-send parameter sets each loop so a decoder can resynchronize.
             if i == 0:
                 payload = self._preamble() + payload
+            if self.aud:
+                # cdhost's end-of-frame marker: AUD plus a trailing start code, which completes the
+                # AUD at once so a viewer can submit the picture without waiting for the next one.
+                payload += ANNEXB + self.grammar["aud"] + ANNEXB
             with self._lock:
                 targets = list(self._clients)
             for c in targets:
@@ -126,6 +196,7 @@ class MockEngine:
                 except OSError:
                     self._drop(c)
             self.nals_sent += len(unit)
+            self.bytes_sent += len(payload)
             with self._lock:
                 rec = self.recorder
             if rec:
@@ -133,7 +204,7 @@ class MockEngine:
                     rec["f"].write(ANNEXB + n)
                     rec["nals"] += 1
                     rec["bytes"] += len(n) + 4
-                    if 16 <= nal_type(n) < 24:
+                    if self.grammar["key"](self._type(n)):
                         rec["saw_keyframe"] = True
             i += 1
             if i >= len(self.units):
@@ -152,21 +223,38 @@ class MockEngine:
         if method == "ping":
             return {"pong": True}
         if method == "list_devices":
-            # Two rows so the sidebar is actually exercised: the replayed device, plus one that is
-            # visible but not connected, which is the state a device hub has to render too.
+            # cdhost's shape (host-c/api_server.c method_list_devices): every row carries udid,
+            # name, os_version AND product_version, product_type, flat screen_width/height (the
+            # bound device only), connection, bound, binding; the envelope adds usbmuxd and
+            # engine_state. The mirror.py spellings ride along -- id, connected, transport,
+            # nested screen_size -- because the macOS app reads those as fallbacks.
+            # Two rows so the sidebar is actually exercised: the replayed device, bound, plus a
+            # second attached one that is not.
+            w, h = self.screen
             return {"devices": [
-                {"id": "mock-0", "udid": "MOCK-REPLAY",
-                 "name": "iPhone13 (replay)", "product_type": "iPhone14,2",
-                 "os_version": "27.0", "connected": True, "transport": "mock",
-                 "screen_size": {"w": self.screen[0], "h": self.screen[1]}},
-                {"id": "mock-1", "udid": "MOCK-OFFLINE",
-                 "name": "Christina's iPhone", "product_type": "iPhone13,3",
-                 "os_version": "26.5.2", "connected": False, "transport": "usbmux"},
-            ]}
+                {"udid": "MOCK-REPLAY", "name": "iPhone13 (replay)",
+                 "os_version": "27.0", "product_version": "27.0", "product_type": "iPhone14,2",
+                 "screen_width": w, "screen_height": h, "connection": "usb",
+                 "bound": True, "binding": False,
+                 "id": "mock-0", "connected": True, "transport": "mock",
+                 "screen_size": {"w": w, "h": h}},
+                {"udid": "MOCK-OTHER", "name": "Christina's iPhone",
+                 "os_version": "26.5.2", "product_version": "26.5.2", "product_type": "iPhone13,3",
+                 "screen_width": 0, "screen_height": 0, "connection": "usb",
+                 "bound": False, "binding": False,
+                 "id": "mock-1", "connected": True, "transport": "usbmux"},
+            ], "usbmuxd": True, "engine_state": "ready"}
+        if method == "select_device":
+            udid = params.get("udid")
+            print(f"  SELECT {udid} (replay engine serves one device; ignored)")
+            return {"udid": "MOCK-REPLAY", "rebinding": False}
         if method == "stream_info":
-            return {"port": 9877, "codec": "hevc", "container": "annexb",
+            up = max(time.time() - self.started, 1e-6)
+            return {"port": 9877, "codec": self.advertise, "container": "annexb",
                     "viewers": len(self._clients), "nals": self.nals_sent,
-                    "rtp_packets": 0, "loops": self.loops, "uptime_s": 0,
+                    "rtp_packets": 0, "loops": self.loops, "uptime_s": int(up),
+                    "mbps": round(self.bytes_sent * 8 / up / 1e6, 2),
+                    "engine": "mock", "streaming": True,
                     "recording": self._rec_stats()}
         if method == "start_recording":
             path = params.get("path") or "replay-recording.h265"
@@ -177,9 +265,7 @@ class MockEngine:
                 if d:
                     os.makedirs(d, exist_ok=True)
                 f = open(path, "wb")
-                for t in (VPS, SPS, PPS):
-                    if t in self.params:
-                        f.write(ANNEXB + self.params[t])
+                f.write(self._preamble())
                 self.recorder = {"path": path, "f": f, "nals": 0, "bytes": 0,
                                  "started": time.time(), "saw_keyframe": False}
             print(f"  RECORD start -> {path}")
@@ -281,6 +367,13 @@ class MockEngine:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file", nargs="?", default="screen3.h265")
+    ap.add_argument("--codec", choices=["auto", "hevc", "h264"], default="auto",
+                    help="the file's codec; auto reads its parameter sets (default)")
+    ap.add_argument("--aud", action="store_true",
+                    help="end each access unit with AUD + start code, as cdhost does")
+    ap.add_argument("--advertise", choices=["hevc", "h264"],
+                    help="the codec stream_info CLAIMS (default: the real one). cdhost says hevc "
+                         "even on an H.264 stream; this reproduces a client trusting that")
     ap.add_argument("--fps", type=float, default=33.0)
     ap.add_argument("--width", type=int, default=1170)
     ap.add_argument("--height", type=int, default=2532)
@@ -292,11 +385,13 @@ def main():
                          "that only appear when several frames are assembled in the same instant.")
     args = ap.parse_args()
 
-    engine = MockEngine(args.file, args.fps, args.width, args.height, args.start_at, args.burst)
+    engine = MockEngine(args.file, args.fps, args.width, args.height, args.start_at, args.burst,
+                        args.codec, args.aud, args.advertise)
     threading.Thread(target=engine.serve_video, daemon=True).start()
     threading.Thread(target=engine.serve_control, daemon=True).start()
     threading.Thread(target=engine.pump_video, daemon=True).start()
-    print(f"replaying at {args.fps} fps, screen {args.width}×{args.height}. Ctrl-C to stop.\n")
+    print(f"replaying {engine.codec.upper()} at {args.fps} fps, screen {args.width}x{args.height}"
+          f"{', AUD-framed' if args.aud else ''}. Ctrl-C to stop.\n", flush=True)
     try:
         while True:
             time.sleep(1)

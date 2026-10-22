@@ -2,3 +2,6 @@ rplay-view
 rplay-gui
 stream-core.o
 audio.o
+.build/
+*.exe
+*.res.o

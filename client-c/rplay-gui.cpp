@@ -76,6 +76,8 @@ extern "C" {
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <knownfolders.h>
 #include <commdlg.h>
 #include <io.h>
 #include <direct.h>
@@ -135,6 +137,7 @@ static inline bool is_sock_wouldblock() {
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <netinet/in.h>   /* IPPROTO_TCP: glibc's <netinet/tcp.h> does not provide it */
 #include <netinet/tcp.h>
 #include <unistd.h>
 static inline void set_sock_timeout(int fd, int timeout_ms) {
@@ -152,6 +155,10 @@ static inline bool is_sock_wouldblock() {
 #include <vector>
 
 using json = nlohmann::json;
+
+#ifndef RPLAYHUB_VERSION
+#define RPLAYHUB_VERSION "0.1.3"   /* client-c/Makefile passes the real one */
+#endif
 
 /* =========================================================================
  * 1. DeviceModel table — ported from app/rPlayHub/DeviceModel.swift
@@ -247,6 +254,24 @@ static std::atomic<uint64_t> g_decode_errors{0};
 static std::atomic<uint64_t> g_nals_total{0};
 static std::atomic<uint64_t> g_trailers_total{0};
 static std::atomic<float>    g_live_fps{0.0f};
+static std::atomic<uint64_t> g_last_frame_ms{0};   /* now_ms() of the last decoded frame; 0 = none yet */
+
+/* The frame rate as of NOW. g_live_fps is only recomputed when a frame decodes, so on its own it
+ * froze at the last value when frames stopped (engine gone, decoder failing) and the toolbar kept
+ * claiming "30 FPS". No frame for over a second means the rate is zero. */
+static float live_fps_now()
+{
+    const uint64_t last = g_last_frame_ms.load();
+    if (!last || now_ms() - last > 1000) return 0.0f;
+    return g_live_fps.load();
+}
+
+/* Frames are actually reaching the screen: one decoded within the last ~2 s. */
+static bool frames_recent()
+{
+    const uint64_t last = g_last_frame_ms.load();
+    return last && now_ms() - last <= 2000;
+}
 
 /* Also populate a DecodedFrame for DisplayWindow (pop-out window) when active. */
 static rplayhub::DecodedFrame g_popout_frame;
@@ -263,6 +288,13 @@ static void on_decoded_frame(AVFrame *f, int active_w, int active_h)
     static uint64_t s_fps_last_ms = 0;
     s_fps_frames++;
     uint64_t now = now_ms();
+    /* After a gap (stream restarted, engine came back) start a fresh window rather than averaging
+     * the new frames over the whole silence. */
+    if (s_fps_last_ms && now - g_last_frame_ms.load() > 1000) {
+        s_fps_frames = 1;
+        s_fps_last_ms = now;
+    }
+    g_last_frame_ms = now;
     if (now - s_fps_last_ms >= 500) {
         if (s_fps_last_ms > 0) {
             g_live_fps = (float)s_fps_frames * 1000.0f / (float)(now - s_fps_last_ms);
@@ -285,6 +317,15 @@ static void video_thread_main()
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
+    /* Pause between sessions that delivered nothing. The engine accepts and holds a viewer while no
+     * device is bound, and closes one it cannot serve, so "connected, then closed, no data" is
+     * normal -- and without a pause it became a reconnect storm. 500 ms doubling to 3 s; reset as
+     * soon as a session carries data. */
+    int backoff_ms = 500;
+    auto pause_backoff = [&backoff_ms]() {
+        for (int waited = 0; waited < backoff_ms && !g_quit; waited += 100) usleep(100 * 1000);
+        backoff_ms = std::min(backoff_ms * 2, 3000);
+    };
     while (!g_quit) {
         g_h264 = stream_says_h264(g_host, g_api_port);
         const AVCodec *codec = avcodec_find_decoder(g_h264 ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC);
@@ -310,15 +351,18 @@ static void video_thread_main()
         if (avcodec_open2(st.dec, codec, nullptr) < 0) {
             avcodec_free_context(&st.dec);
             close(fd);
+            pause_backoff();
             continue;
         }
 
         g_stream_connected = true;
         annexb_parser parser = {};
         uint8_t buf[65536];
+        bool got_data = false;
         while (!g_quit) {
             ssize_t r = recv(fd, (char *)buf, (int)sizeof buf, 0);
             if (r > 0) {
+                if (!got_data) { got_data = true; backoff_ms = 500; }
                 annexb_feed(&parser, buf, (size_t)r, handle_nal, &st);
                 /* Drain any remaining packets from the current burst */
                 for (;;) {
@@ -349,6 +393,7 @@ static void video_thread_main()
         if (st.frame) av_frame_free(&st.frame);
         avcodec_free_context(&st.dec);
         close(fd);
+        if (!got_data) pause_backoff();
     }
 }
 
@@ -431,6 +476,9 @@ static json api_call(const std::string &method, const json &params = json::objec
                 std::string code = json_get_str(err, "code", "");
                 std::string msg  = json_get_str(err, "message", "");
                 r["error_code"]  = code;
+                /* A newer engine answers device methods with no_device while it waits for a phone;
+                 * that is a state, not a fault -- keep the wording plain wherever it surfaces. */
+                if (code == "no_device") msg = "No iPhone connected";
                 if (msg.empty()) msg = code.empty() ? "error" : code;
                 r["error"] = msg;
             } else if (!r["error"].is_string()) {
@@ -486,6 +534,433 @@ static void api_async(const std::string &method, const json &params,
 }
 
 /* =========================================================================
+ * 3b. Engine ownership
+ * =========================================================================
+ * On Windows the GUI owns the engine (this replaces start-rplay.bat): when nothing answers on the
+ * API port it starts cdhost.exe hidden, logging to %LOCALAPPDATA%\rplayhub\cdhost.log, inside a
+ * Job Object with KILL_ON_JOB_CLOSE so the engine -- and the copy it re-spawns on a device rebind,
+ * which inherits the job -- dies with the GUI. "The port answers" is the source of truth, never
+ * the process handle: a rebind replaces the engine process with a new PID by design.
+ *
+ * Elsewhere nothing is spawned; the state below is still fed by list_devices so the placeholder
+ * can say "engine not running" instead of "no devices". */
+static std::atomic<int>  g_engine_reachable{-1};   /* -1 unknown, 0 no, 1 yes */
+#ifdef _WIN32
+static bool              g_engine_spawn = true;     /* --no-engine turns it off */
+#else
+static bool              g_engine_spawn = false;    /* accepted for symmetry; nothing is spawned */
+#endif
+
+#ifdef _WIN32
+enum class EngineProc { Unknown, Starting, Running, External, Down, Failed };
+static std::atomic<int>  g_engine_proc{(int)EngineProc::Unknown};
+static std::atomic<bool> g_engine_retry{false};     /* UI -> supervisor: try again after giving up */
+static std::atomic<uint64_t> g_engine_rebind_until_ms{0};   /* no respawn before this (select_device) */
+static std::mutex        g_engine_mu;
+static std::string       g_engine_error;            /* guarded by g_engine_mu */
+static std::string       g_engine_log_path;         /* set once before any thread starts */
+
+static std::string engine_error()
+{
+    std::lock_guard<std::mutex> lk(g_engine_mu);
+    return g_engine_error;
+}
+
+static void set_engine_error(const std::string &e)
+{
+    std::lock_guard<std::mutex> lk(g_engine_mu);
+    g_engine_error = e;
+}
+
+static std::wstring utf8_to_w(const std::string &s)
+{
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+static std::string w_to_utf8(const std::wstring &w)
+{
+    if (w.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::wstring win_full_path(const std::wstring &p)
+{
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = GetFullPathNameW(p.c_str(), (DWORD)(sizeof buf / sizeof buf[0]), buf, nullptr);
+    return (n > 0 && n < sizeof buf / sizeof buf[0]) ? std::wstring(buf, n) : p;
+}
+
+static bool win_is_file(const std::wstring &p)
+{
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool win_is_dir(const std::wstring &p)
+{
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* The folder holding rplay-gui.exe, without a trailing separator. */
+static std::wstring win_exe_dir()
+{
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)(sizeof buf / sizeof buf[0]));
+    std::wstring p(buf, n);
+    size_t cut = p.find_last_of(L"\\/");
+    return cut == std::wstring::npos ? L"." : p.substr(0, cut);
+}
+
+/* %LOCALAPPDATA%\rplayhub, created on first use. Logs and per-machine state live here. */
+static std::wstring win_local_data_dir()
+{
+    const wchar_t *la = _wgetenv(L"LOCALAPPDATA");
+    std::wstring base = la && *la ? la : win_exe_dir();
+    std::wstring dir = base + L"\\rplayhub";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+static bool win_env_set(const wchar_t *name)
+{
+    return GetEnvironmentVariableW(name, nullptr, 0) > 0;
+}
+
+static void win_env_default(const wchar_t *name, const std::wstring &value)
+{
+    if (!win_env_set(name)) SetEnvironmentVariableW(name, value.c_str());
+}
+
+static HANDLE g_engine_job     = nullptr;
+static HANDLE g_engine_process = nullptr;   /* the one we started last; may have re-exec'd away */
+
+/* Is anything we started still running? Covers the rebind case, where the process we created
+ * exits after starting its replacement -- which is in the same job. */
+static bool engine_job_alive()
+{
+    if (g_engine_job) {
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info{};
+        if (QueryInformationJobObject(g_engine_job, JobObjectBasicAccountingInformation,
+                                      &info, sizeof info, nullptr))
+            return info.ActiveProcesses > 0;
+    }
+    return g_engine_process && WaitForSingleObject(g_engine_process, 0) == WAIT_TIMEOUT;
+}
+
+/* Returns false and sets g_engine_error when there is nothing to start or it would not start. */
+static bool engine_spawn(bool first)
+{
+    const std::wstring exe_dir = win_exe_dir();
+    wchar_t cwd_buf[MAX_PATH * 2] = {0};
+    GetCurrentDirectoryW((DWORD)(sizeof cwd_buf / sizeof cwd_buf[0]), cwd_buf);
+    const std::wstring candidates[] = {
+        exe_dir + L"\\cdhost.exe",
+        exe_dir + L"\\..\\host-c\\cdhost.exe",
+        std::wstring(cwd_buf) + L"\\host-c\\cdhost.exe",
+    };
+    std::wstring cdhost;
+    for (const auto &c : candidates) {
+        if (win_is_file(c)) { cdhost = win_full_path(c); break; }
+    }
+    if (cdhost.empty()) {
+        set_engine_error("cdhost.exe was not found next to rplay-gui.exe (or in ..\\host-c).");
+        fprintf(stderr, "engine: cdhost.exe not found; looked in %s\n", w_to_utf8(exe_dir).c_str());
+        return false;
+    }
+
+    /* The defaults start-rplay.bat used to set; anything the user set already wins. */
+    win_env_default(L"RPLAY_USERSPACE_NET", L"1");
+    win_env_default(L"RPLAY_KEYFRAME_EVERY_S", L"0");
+    win_env_default(L"RPLAY_FPS", L"60");
+    win_env_default(L"RPLAY_MAX_BITRATE", L"15000000");
+    if (!win_env_set(L"RPLAY_DDI")) {
+        const std::wstring ddis[] = {
+            exe_dir + L"\\iOS_DDI",
+            win_local_data_dir() + L"\\iOS_DDI",
+            exe_dir + L"\\..\\deps\\iOS_DDI",   /* a source checkout */
+        };
+        for (const auto &d : ddis) {
+            if (win_is_dir(d)) { SetEnvironmentVariableW(L"RPLAY_DDI", win_full_path(d).c_str()); break; }
+        }
+    }
+
+    if (!g_engine_job) {
+        g_engine_job = CreateJobObjectW(nullptr, nullptr);
+        if (g_engine_job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+            li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(g_engine_job, JobObjectExtendedLimitInformation, &li, sizeof li);
+        }
+    }
+
+    /* A fresh log per GUI session (the last one kept as cdhost.prev.log); respawns append. */
+    const std::wstring log_dir = win_local_data_dir();
+    const std::wstring log = log_dir + L"\\cdhost.log";
+    if (first) MoveFileExW(log.c_str(), (log_dir + L"\\cdhost.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+    SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+    HANDLE hlog = CreateFileW(log.c_str(), FILE_APPEND_DATA | SYNCHRONIZE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE hnul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                              OPEN_EXISTING, 0, nullptr);
+    if (hlog != INVALID_HANDLE_VALUE) {
+        char hdr[160];
+        time_t t = time(nullptr);
+        struct tm tm{};
+        localtime_s(&tm, &t);
+        int n = (int)strftime(hdr, sizeof hdr, "\r\n=== rplay-gui started cdhost.exe at %Y-%m-%d %H:%M:%S ===\r\n", &tm);
+        DWORD wr = 0;
+        WriteFile(hlog, hdr, (DWORD)n, &wr, nullptr);
+    }
+
+    /* Only the log and NUL are inherited -- not whatever sockets this process has open. */
+    HANDLE inherit[2];
+    DWORD n_inherit = 0;
+    if (hlog != INVALID_HANDLE_VALUE) inherit[n_inherit++] = hlog;
+    if (hnul != INVALID_HANDLE_VALUE) inherit[n_inherit++] = hnul;
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+    std::vector<uint8_t> attr_buf(attr_size);
+    auto *attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+    bool have_attrs = n_inherit > 0 && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
+                      UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
+                                                n_inherit * sizeof(HANDLE), nullptr, nullptr);
+
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof si;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput  = hnul != INVALID_HANDLE_VALUE ? hnul : nullptr;
+    si.StartupInfo.hStdOutput = hlog != INVALID_HANDLE_VALUE ? hlog : nullptr;
+    si.StartupInfo.hStdError  = si.StartupInfo.hStdOutput;
+    if (have_attrs) si.lpAttributeList = attrs;
+
+    std::wstring cmdline = L"\"" + cdhost + L"\"";
+    std::wstring workdir = cdhost.substr(0, cdhost.find_last_of(L"\\/"));
+    PROCESS_INFORMATION pi{};
+    DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | (have_attrs ? EXTENDED_STARTUPINFO_PRESENT : 0);
+    BOOL ok = CreateProcessW(cdhost.c_str(), &cmdline[0], nullptr, nullptr, n_inherit > 0, flags,
+                             nullptr, workdir.c_str(), &si.StartupInfo, &pi);
+    DWORD err = ok ? 0 : GetLastError();
+    if (have_attrs) DeleteProcThreadAttributeList(attrs);
+    if (hlog != INVALID_HANDLE_VALUE) CloseHandle(hlog);
+    if (hnul != INVALID_HANDLE_VALUE) CloseHandle(hnul);
+    if (!ok) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "Could not start cdhost.exe (Windows error %lu).", (unsigned long)err);
+        set_engine_error(msg);
+        fprintf(stderr, "engine: CreateProcess(%s) failed: %lu\n", w_to_utf8(cdhost).c_str(), (unsigned long)err);
+        return false;
+    }
+    if (g_engine_job && !AssignProcessToJobObject(g_engine_job, pi.hProcess)) {
+        /* Still usable; it just will not be cleaned up by the job. main() terminates it instead. */
+        fprintf(stderr, "engine: could not put cdhost in a job object (error %lu)\n", GetLastError());
+    }
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    if (g_engine_process) CloseHandle(g_engine_process);
+    g_engine_process = pi.hProcess;
+    printf("engine: started %s (pid %lu), log %s\n", w_to_utf8(cdhost).c_str(),
+           (unsigned long)pi.dwProcessId, g_engine_log_path.c_str());
+    fflush(stdout);
+    return true;
+}
+
+/* After the engine we started has gone: record why, and say whether starting it again is
+ * pointless. A missing DLL (cdhost.exe built against MSYS2's shared libraries but run without
+ * them on PATH) exits before main() with nothing in the log, so name it here. */
+static bool engine_exited_for_good()
+{
+    DWORD code = 0;
+    if (!g_engine_process || !GetExitCodeProcess(g_engine_process, &code) || code == STILL_ACTIVE)
+        return false;
+    char msg[256];
+    if (code == 0xC0000135u /* STATUS_DLL_NOT_FOUND */ || code == 0xC0000139u /* ENTRYPOINT_NOT_FOUND */) {
+        snprintf(msg, sizeof msg, "cdhost.exe cannot start: a DLL it needs is missing (exit 0x%08lX). "
+                 "Put its DLLs next to it.", (unsigned long)code);
+        set_engine_error(msg);
+        fprintf(stderr, "engine: %s\n", msg);
+        return true;
+    }
+    snprintf(msg, sizeof msg, "cdhost.exe exited (code %lu).", (unsigned long)code);
+    if (engine_error() != msg) fprintf(stderr, "engine: %s\n", msg);
+    set_engine_error(msg);
+    return false;
+}
+
+/* A quick "does anything listen on the API port". Non-blocking with a short timeout: a refused
+ * loopback connect on Windows otherwise takes about two seconds of SYN retries. */
+static bool engine_port_answers(int timeout_ms)
+{
+    SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == INVALID_SOCKET) return false;
+    u_long nb = 1;
+    ioctlsocket(fd, FIONBIO, &nb);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)g_api_port);
+    inet_pton(AF_INET, g_host, &sa.sin_addr);
+    bool up = false;
+    if (connect(fd, (sockaddr *)&sa, sizeof sa) == 0) {
+        up = true;
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set wr, ex;
+        FD_ZERO(&wr); FD_ZERO(&ex);
+        FD_SET(fd, &wr); FD_SET(fd, &ex);
+        timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        if (select(0, nullptr, &wr, &ex, &tv) > 0 && FD_ISSET(fd, &wr) && !FD_ISSET(fd, &ex)) up = true;
+    }
+    closesocket(fd);
+    return up;
+}
+
+/* Supervisor: probes the port once a second; starts the engine when nothing answers at startup,
+ * and starts it again only when the port has been dead for more than 20 s, nothing we started is
+ * still running, and no device switch is in flight -- a rebind or a tunnel loss makes the engine
+ * replace itself with a new process that retries its ports for up to 15 s, which is not a crash.
+ * Gives up after a few consecutive starts that never came up. */
+static void engine_supervisor_main()
+{
+    const int kMaxStarts = 4;
+    const int kDeadMs = 20000;
+    int starts_without_answer = 0;
+    bool spawned_any = false, ever_up = false;
+    uint64_t dead_since = 0, last_spawn = 0;
+    {
+        /* tcp_connect() normally initialises Winsock; this thread may run first. */
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
+    while (!g_quit) {
+        bool force = false;
+        if (g_engine_retry.exchange(false)) {   /* the user pressed Retry */
+            starts_without_answer = 0;
+            set_engine_error("");
+            g_engine_proc = (int)EngineProc::Starting;
+            force = true;
+        }
+        const bool up = engine_port_answers(500);
+        const uint64_t now = now_ms();
+        g_engine_reachable = up ? 1 : 0;
+        if (up) {
+            ever_up = true;
+            dead_since = 0;
+            starts_without_answer = 0;
+            g_engine_proc = (int)(spawned_any && engine_job_alive() ? EngineProc::Running : EngineProc::External);
+            set_engine_error("");
+        } else {
+            if (!dead_since) dead_since = now;
+            if (!g_engine_spawn) {
+                g_engine_proc = (int)EngineProc::Down;
+            } else if (engine_job_alive()) {
+                /* Ours, starting up or mid-rebind: wait for it. */
+                g_engine_proc = (int)EngineProc::Starting;
+            } else if (starts_without_answer >= kMaxStarts) {
+                if (g_engine_proc != (int)EngineProc::Failed) {
+                    if (engine_error().empty())
+                        set_engine_error("cdhost.exe keeps exiting without answering.");
+                    fprintf(stderr, "engine: giving up after %d starts; see %s\n", kMaxStarts,
+                            g_engine_log_path.c_str());
+                }
+                g_engine_proc = (int)EngineProc::Failed;
+            } else if (!force && spawned_any && engine_exited_for_good()) {
+                g_engine_proc = (int)EngineProc::Failed;   /* retrying cannot help; error is set */
+                starts_without_answer = kMaxStarts;
+            } else if (force || (!spawned_any && !ever_up) ||
+                       (now - dead_since >= kDeadMs && now - last_spawn >= kDeadMs &&
+                        now >= g_engine_rebind_until_ms.load())) {
+                if (spawned_any || ever_up)
+                    fprintf(stderr, "engine: not answering for %d s -- starting it again\n", kDeadMs / 1000);
+                if (engine_spawn(!spawned_any)) {
+                    spawned_any = true;
+                    last_spawn = now;
+                    starts_without_answer++;
+                    set_engine_error("");
+                    g_engine_proc = (int)EngineProc::Starting;
+                } else {
+                    starts_without_answer = kMaxStarts;   /* not found / will not start: no retry loop */
+                    g_engine_proc = (int)EngineProc::Failed;
+                }
+            }
+        }
+        /* Every second while it is down; every 5 s while it answers (each probe is a connection the
+         * engine logs, and the 3 s list_devices poll already watches it). */
+        const int ticks = up ? 50 : 10;
+        for (int i = 0; i < ticks && !g_quit && !g_engine_retry.load(); i++) Sleep(100);
+    }
+}
+
+/* The monitor's scale factor (96 dpi = 1.0). Meaningful because the process is DPI aware. */
+static float win_display_scale(int display)
+{
+    float ddpi = 0.0f;
+    if (display < 0) display = 0;
+    if (SDL_GetDisplayDPI(display, &ddpi, nullptr, nullptr) == 0 && ddpi > 0.0f)
+        return std::clamp(ddpi / 96.0f, 1.0f, 3.0f);
+    return 1.0f;
+}
+
+/* Must run before any thread starts (g_engine_log_path is read without a lock). */
+static std::thread engine_start_supervisor()
+{
+    g_engine_log_path = w_to_utf8(win_local_data_dir() + L"\\cdhost.log");
+    const bool local = !strcmp(g_host, "127.0.0.1") || !strcmp(g_host, "localhost");
+    if (g_engine_spawn && (!local || g_api_port != 9876)) {
+        /* cdhost listens on 127.0.0.1:9876 only; starting one would not serve what -h/-A point at. */
+        fprintf(stderr, "engine: not starting cdhost for %s:%d (it serves 127.0.0.1:9876 only)\n",
+                g_host, g_api_port);
+        g_engine_spawn = false;
+    }
+    return std::thread(engine_supervisor_main);
+}
+
+/* At exit: closing the job kills everything we started (including a re-exec'd engine). An engine
+ * we did not start is left alone. */
+static void engine_shutdown()
+{
+    if (g_engine_job) {
+        CloseHandle(g_engine_job);   /* KILL_ON_JOB_CLOSE */
+        g_engine_job = nullptr;
+    } else if (g_engine_process && WaitForSingleObject(g_engine_process, 0) == WAIT_TIMEOUT) {
+        TerminateProcess(g_engine_process, 0);
+    }
+    if (g_engine_process) { CloseHandle(g_engine_process); g_engine_process = nullptr; }
+}
+
+/* A GUI-subsystem exe has no console. Keep stdout/stderr useful: leave them alone when the parent
+ * redirected them (a pipe or a file), attach to the parent's console when started from one, and
+ * otherwise write them to %LOCALAPPDATA%\rplayhub\rplay-gui.log. */
+static void win_setup_stdio()
+{
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN) {
+        setvbuf(stdout, nullptr, _IONBF, 0);
+        return;
+    }
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        if (freopen("CONOUT$", "w", stdout) && freopen("CONOUT$", "w", stderr)) {
+            setvbuf(stdout, nullptr, _IONBF, 0);
+            return;
+        }
+    }
+    std::wstring log = win_local_data_dir() + L"\\rplay-gui.log";
+    std::wstring prev = win_local_data_dir() + L"\\rplay-gui.prev.log";
+    MoveFileExW(log.c_str(), prev.c_str(), MOVEFILE_REPLACE_EXISTING);
+    /* Both in append mode (the old file was just moved aside), so their lines interleave rather
+     * than overwrite each other. */
+    if (_wfreopen(log.c_str(), L"a", stdout)) setvbuf(stdout, nullptr, _IONBF, 0);
+    if (_wfreopen(log.c_str(), L"a", stderr)) setvbuf(stderr, nullptr, _IONBF, 0);
+}
+#endif
+
+/* =========================================================================
  * 4. Base64 decode & file helpers
  * ========================================================================= */
 static std::vector<uint8_t> b64_decode(const std::string &in)
@@ -517,19 +992,34 @@ static std::vector<uint8_t> b64_decode(const std::string &in)
     return out;
 }
 
+#ifdef _WIN32
+static const char kPathSep[] = "\\";
+#else
+static const char kPathSep[] = "/";
+#endif
+
 static std::string ensure_media_dir(const char *subdir)
 {
 #ifdef _WIN32
     const char *home = getenv("USERPROFILE");
     if (!home) home = getenv("TEMP");
     std::string base = home ? home : ".";
+    /* The real Downloads / Pictures folders (users move them, e.g. to OneDrive or another drive),
+     * falling back to %USERPROFILE%\<subdir>. */
+    std::string dir = base + kPathSep + subdir;
+    const KNOWNFOLDERID *kf = !strcmp(subdir, "Downloads") ? &FOLDERID_Downloads
+                            : !strcmp(subdir, "Pictures")  ? &FOLDERID_Pictures : nullptr;
+    PWSTR known = nullptr;
+    if (kf && SUCCEEDED(SHGetKnownFolderPath(*kf, KF_FLAG_CREATE, nullptr, &known)) && known)
+        dir = w_to_utf8(known);
+    if (known) CoTaskMemFree(known);
 #else
     const char *home = getenv("HOME");
     std::string base = home ? home : "/tmp";
-#endif
     std::string dir = base + "/" + subdir;
+#endif
     mkdir(dir.c_str(), 0755);
-    std::string sub = dir + "/rPlayHub";
+    std::string sub = dir + kPathSep + "rPlayHub";
     if (mkdir(sub.c_str(), 0755) == 0 || access(sub.c_str(), W_OK) == 0) return sub;
     if (access(dir.c_str(), W_OK) == 0) return dir;
 #ifdef _WIN32
@@ -590,6 +1080,10 @@ static std::string format_relative_time(int64_t mtime)
     return tbuf;
 }
 
+#ifdef _WIN32
+static HWND main_window_hwnd();
+#endif
+
 /* Native desktop file dialog helper (zenity on GNOME, kdialog on KDE, GetOpenFileName on Windows) run on a worker thread. */
 static void pick_file_async(const char *title, const char *zenity_filter, const char *kdialog_filter,
                             std::function<void(const std::string &)> on_picked)
@@ -597,11 +1091,14 @@ static void pick_file_async(const char *title, const char *zenity_filter, const 
 #ifdef _WIN32
     (void)zenity_filter; (void)kdialog_filter;
     std::string wtitle = title ? title : "Select File";
-    std::thread([wtitle, on_picked]() {
+    /* Owned by the main window, so it stays in front of it and the window waits for it. With the
+     * manifest's UTF-8 code page the A API takes and returns UTF-8 paths. */
+    HWND owner = main_window_hwnd();
+    std::thread([wtitle, on_picked, owner]() {
         char filename[MAX_PATH] = { 0 };
         OPENFILENAMEA ofn = {};
         ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = NULL;
+        ofn.hwndOwner = owner;
         ofn.lpstrFile = filename;
         ofn.nMaxFile = sizeof(filename);
         ofn.lpstrTitle = wtitle.c_str();
@@ -738,6 +1235,16 @@ static SDL_Window   *g_win      = nullptr;
 static SDL_Renderer *g_ren      = nullptr;
 static float         g_scale    = 1.0f;
 static bool          g_argb     = false;
+static std::string   g_renderer_name;   /* SDL_GetRendererInfo's name, for Diagnostics */
+#ifdef _WIN32
+static HWND main_window_hwnd()
+{
+    if (!g_win) return nullptr;
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    return SDL_GetWindowWMInfo(g_win, &info) ? info.info.win.window : nullptr;
+}
+#endif
 #ifdef _WIN32
 static bool          g_system_titlebar = true;
 #else
@@ -954,6 +1461,16 @@ static void discover_fonts()
     std::string base = base_raw ? base_raw : "./";
     if (base_raw) SDL_free(base_raw);
 
+    /* %WINDIR%\Fonts\<name> on Windows; "" elsewhere, which find_existing_file skips. Inter is
+     * found first next to the exe ("fonts\" in the installed layout, via `base`). */
+#ifdef _WIN32
+    const char *windir = getenv("WINDIR");
+    const std::string win_fonts = std::string(windir && *windir ? windir : "C:\\Windows") + "\\Fonts\\";
+    auto W = [&](const char *name) { return win_fonts + name; };
+#else
+    auto W = [](const char *) { return std::string(); };
+#endif
+
     g_regular_font_path = find_existing_file({
         base + "fonts/Inter-Regular.ttf",
         base + "../fonts/Inter-Regular.ttf",
@@ -964,6 +1481,7 @@ static void discover_fonts()
         "/usr/share/fonts/opentype/inter/Inter-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        W("segoeui.ttf"),
     });
     g_medium_font_path = find_existing_file({
         base + "fonts/Inter-Medium.ttf",
@@ -984,6 +1502,7 @@ static void discover_fonts()
         "/usr/share/fonts/truetype/inter/Inter-SemiBold.ttf",
         "/usr/share/fonts/opentype/inter/Inter-SemiBold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        W("seguisb.ttf"),
         g_medium_font_path,
     });
     g_bold_font_path = find_existing_file({
@@ -995,26 +1514,33 @@ static void discover_fonts()
         "/usr/share/fonts/truetype/inter/Inter-Bold.ttf",
         "/usr/share/fonts/opentype/inter/Inter-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        W("segoeuib.ttf"),
         g_semibold_font_path,
     });
     g_mono_font_path = find_existing_file({
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        W("consola.ttf"),
         g_regular_font_path,
     });
 
-    struct CjkCandidate { const char *path; int face; };
-    static const CjkCandidate kCjkCandidates[] = {
+    /* Merged into every face for names in Chinese, Japanese or Korean. Windows: Microsoft YaHei,
+     * Yu Gothic, Malgun Gothic -- whichever is installed first, like the Linux list. */
+    struct CjkCandidate { std::string path; int face; };
+    const CjkCandidate kCjkCandidates[] = {
         {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 2},
         {"/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc", 2},
         {"/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 2},
         {"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 2},
         {"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0},
         {"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0},
+        {W("msyh.ttc"), 0},
+        {W("YuGothM.ttc"), 0},
+        {W("malgun.ttf"), 0},
     };
     for (const auto &c : kCjkCandidates) {
-        if (access(c.path, R_OK) == 0) {
+        if (!c.path.empty() && access(c.path.c_str(), R_OK) == 0) {
             g_cjk_font_path = c.path;
             g_cjk_font_face = c.face;
             break;
@@ -1107,15 +1633,39 @@ static void refresh_apps();
 static void refresh_profiles();
 static void refresh_files();
 
+/* First-run state from list_devices. Newer engines add these fields; an older engine leaves them
+ * out, which reads as "unknown" and keeps the plain device-list behaviour. UI thread only. */
+static int         g_usbmuxd_ok = -1;     /* -1 unknown, 0 unreachable, 1 fine */
+static std::string g_usbmuxd_error;
+static std::string g_engine_state;        /* "waiting_for_device" | "binding" | "ready" | "" */
+static std::string g_engine_bringup_error; /* "<udid>: <reason>", last bring-up failure while not ready */
+static std::string g_ddi_error;           /* last activate failure about the Developer Disk Image */
+
 static void refresh_devices()
 {
     api_async("list_devices", {}, [](const json &r) {
-        if (!r.value("ok", false)) return;
+        if (!r.value("ok", false)) {
+            /* Our own api_call error when nothing listens; anything else came from the engine. */
+            if (json_err_str(r, "").rfind("cannot connect", 0) == 0) g_engine_reachable = 0;
+            return;
+        }
+        g_engine_reachable = 1;
+        const json res = r.value("result", json::object());
+        if (res.contains("usbmuxd") && res["usbmuxd"].is_boolean()) {
+            g_usbmuxd_ok    = res["usbmuxd"].get<bool>() ? 1 : 0;
+            g_usbmuxd_error = g_usbmuxd_ok ? "" : json_get_str(res, "usbmuxd_error", "");
+        } else {
+            g_usbmuxd_ok = -1;
+            g_usbmuxd_error.clear();
+        }
+        g_engine_state = json_get_str(res, "engine_state", "");
+        g_engine_bringup_error = json_get_str(res, "engine_error", "");
+
         std::vector<DeviceRow> list;
         std::string prev_bound = g_bound_udid;
         g_bound_udid.clear();
 
-        auto arr = r["result"].value("devices", json::array());
+        auto arr = res.value("devices", json::array());
         int bound_idx = -1;
         for (const auto &d : arr) {
             DeviceRow row;
@@ -1150,6 +1700,7 @@ static void refresh_devices()
 
         if (!g_bound_udid.empty() && g_bound_udid != prev_bound) {
             g_switching_device   = false;
+            g_ddi_error.clear();
             g_settings_loaded    = false;
             g_reports_loaded     = false;
             g_device_info_loaded = false;
@@ -1171,10 +1722,54 @@ static void refresh_devices()
     }, 5);
 }
 
+/* The engine stopped answering: nothing is bound any more. Rows stay (they are the last list we
+ * had) but lose their bound dot; engine state and stream numbers are dropped so no panel keeps
+ * reporting a session that no longer exists. Cheap and idempotent -- called every frame while the
+ * engine is unreachable. UI thread only. */
+static void forget_engine_session()
+{
+    g_bound_udid.clear();
+    for (auto &d : g_devices) d.bound = false;
+    g_engine_state.clear();
+    g_engine_bringup_error.clear();
+    g_usbmuxd_ok = -1;
+    g_usbmuxd_error.clear();
+    if (!g_stream_info.empty()) g_stream_info = json::object();
+}
+
+/* "activate" mounts the Developer Disk Image. Its failures were dropped; the DDI ones are the
+ * reason a phone cannot be mirrored or controlled, so say so. */
+static void activate_device()
+{
+    api_async("activate", {}, [](const json &r) {
+        if (r.value("ok", false)) { g_ddi_error.clear(); return; }
+        const std::string code = json_get_str(r, "error_code", "");
+        if (code == "no_ddi") {
+#ifdef _WIN32
+            g_ddi_error = "Developer Disk Image not found. Put the iOS_DDI folder next to rplay-gui.exe "
+                          "or in %LOCALAPPDATA%\\rplayhub\\iOS_DDI, then restart rPlayHub.";
+#else
+            g_ddi_error = "Developer Disk Image not found (run scripts/fetch-ddi.sh).";
+#endif
+        } else if (code == "locked") {
+            g_ddi_error = "Unlock the iPhone to mount the Developer Disk Image.";
+        } else if (code == "tss_failed") {
+            g_ddi_error = "Developer Disk Image: " + json_err_str(r, "Apple's signing server refused");
+        } else {
+            return;
+        }
+        show_toast(g_ddi_error, 8000);
+    });
+}
+
 static void switch_to_device(const std::string &udid, const std::string &name)
 {
     if (udid.empty() || udid == g_bound_udid) return;
     g_switching_device = true;
+#ifdef _WIN32
+    /* The engine may replace itself with a new process for this; keep the supervisor's hands off. */
+    g_engine_rebind_until_ms = now_ms() + 45000;
+#endif
     show_toast("Switching engine to " + name + "…", 5000);
     api_async("select_device", {{"udid", udid}}, [](const json &r) {
         if (!r.value("ok", false)) {
@@ -1574,7 +2169,14 @@ static void save_remote_file(const std::string &service, const std::string &remo
             return;
         }
         auto bytes = b64_decode(r["result"].value("data_b64", ""));
-        std::string out_path = ensure_media_dir("Downloads") + "/" + filename;
+        std::string leaf = filename;
+#ifdef _WIN32
+        /* Device file names may hold characters Windows forbids; a ':' would even silently write
+         * an NTFS alternate data stream instead of a file. */
+        for (char &c : leaf)
+            if (strchr("\\/:*?\"<>|", c) || (unsigned char)c < 0x20) c = '_';
+#endif
+        std::string out_path = ensure_media_dir("Downloads") + kPathSep + leaf;
         FILE *fp = fopen(out_path.c_str(), "wb");
         if (!fp) {
             show_toast("Cannot write " + out_path, 6000);
@@ -1653,7 +2255,7 @@ static void take_screenshot_action()
             return;
         }
         auto png = b64_decode(r["result"].value("image_b64", ""));
-        std::string path = ensure_media_dir("Pictures") + "/" + timestamp_filename("rPlayHub_iOS", ".png");
+        std::string path = ensure_media_dir("Pictures") + kPathSep + timestamp_filename("rPlayHub_iOS", ".png");
         FILE *f = fopen(path.c_str(), "wb");
         if (!f) { show_toast("Cannot write " + path, 6000); return; }
         fwrite(png.data(), 1, png.size(), f);
@@ -2140,7 +2742,12 @@ static LRESULT CALLBACK Win32MenuSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             SDL_SetWindowAlwaysOnTop(g_win, g_pinned ? SDL_TRUE : SDL_FALSE);
             break;
         case IDM_HELP_ABOUT:
-            MessageBoxW(hWnd, L"rPlayHub \xe2\x80\x94 High-performance iOS Screen Mirroring & Control\nVersion 1.0.0\n\nCopyright \xc2\xa9 2026 rPlayAI Team", L"About rPlayHub", MB_OK | MB_ICONINFORMATION);
+        {
+            /* Built from UTF-8: "\xe2\x80\x94" inside an L"" literal is three separate wide chars. */
+            std::wstring about = utf8_to_w("rPlayHub \xe2\x80\x94 iOS Screen Mirroring & Control\nVersion "
+                                           RPLAYHUB_VERSION "\n\nCopyright \xc2\xa9 2026 rPlayAI");
+            MessageBoxW(hWnd, about.c_str(), L"About rPlayHub", MB_OK | MB_ICONINFORMATION);
+        }
             break;
         }
         return 0;
@@ -2347,10 +2954,12 @@ static void render_titlebar(float win_w)
     if (g_switching_device) {
         status_str = "Switching device…";
         status_col = IM_COL32(255, 149, 0, 255);
-    } else if (g_stream_connected && g_vtex_w > 0) {
+    } else if (g_stream_connected && g_vtex_w > 0 && frames_recent()) {
+        /* Green only while pictures are actually arriving: a connected socket and an old texture
+         * are not a stream (that read "HEVC · 30 FPS" over a decoder that had produced nothing). */
         char sbuf[128];
         double mbps = g_stream_info.is_object() ? g_stream_info.value("mbps", 0.0) : 0.0;
-        float fps = g_live_fps.load();
+        float fps = live_fps_now();
         if (fps > 0.0f) {
             snprintf(sbuf, sizeof sbuf, "%s \xc2\xb7 %.1f Mbps \xc2\xb7 %.0f FPS", g_h264 ? "H.264" : "HEVC", mbps, fps);
         } else {
@@ -2358,8 +2967,25 @@ static void render_titlebar(float win_w)
         }
         status_str = sbuf;
         status_col = IM_COL32(52, 160, 90, 255);
+    } else if (g_stream_connected && (g_engine_state.empty() || g_engine_state == "ready")) {
+        /* Connected but nothing decoding. (While the engine has no device it holds viewers
+         * open; the stage prompt explains that case, so the toolbar stays quiet.) Say whether the decoder is rejecting what arrives
+         * (errors still climbing in the last ~2 s) or nothing decodable has come yet. */
+        static uint64_t s_err_seen = 0, s_err_change_ms = 0;
+        const uint64_t errs = g_decode_errors.load(), now = now_ms();
+        if (errs != s_err_seen) { s_err_seen = errs; s_err_change_ms = now; }
+        if (errs > 0 && now - s_err_change_ms <= 2000) {
+            char sbuf[96];
+            snprintf(sbuf, sizeof sbuf, "%s \xc2\xb7 Decode errors (%llu)", g_h264 ? "H.264" : "HEVC",
+                     (unsigned long long)errs);
+            status_str = sbuf;
+            status_col = IM_COL32(215, 58, 50, 255);
+        } else {
+            status_str = "Waiting for frames…";
+            status_col = IM_COL32(255, 149, 0, 255);
+        }
     } else if (!g_bound_udid.empty()) {
-        status_str = g_stream_connected ? "Connected" : "Waiting for stream…";
+        status_str = "Waiting for stream…";
     }
     if (!status_str.empty() && g_font_caption) {
         dl->AddText(g_font_caption, 12.5f * s,
@@ -2436,6 +3062,85 @@ static void render_titlebar(float win_w)
 /* =========================================================================
  * 11. Left Device Sidebar (260pt, matching gui_app.cc::renderLeftSidebar & sidebarRow)
  * ========================================================================= */
+/* What the empty stage should say instead of "No device selected": the engine is not up, the
+ * iPhone USB service is missing, or the engine is waiting for / binding a phone. Inactive when
+ * there is a device to show or nothing better to say (an older engine without engine_state). */
+struct StageStatus {
+    bool        active = false;
+    std::string title;
+    std::string detail;
+    bool        store_button = false;   /* offer Apple Devices from the Microsoft Store */
+    bool        log_button   = false;   /* offer the engine log */
+};
+
+static StageStatus stage_status()
+{
+    StageStatus st;
+    const int reach = g_engine_reachable.load();
+    if (reach != 1) {
+#ifdef _WIN32
+        const auto proc = (EngineProc)g_engine_proc.load();
+        if (!g_engine_spawn) {
+            if (reach == -1) return st;
+            st.title  = "Engine not running";
+            st.detail = "rPlayHub was started with --no-engine (or for another host/port): start cdhost.exe yourself.";
+        } else if (proc == EngineProc::Failed) {
+            st.title  = "Engine not running";
+            std::string err = engine_error();
+            st.detail = (err.empty() ? std::string("cdhost.exe stopped.") : err) + "\nLog: " + g_engine_log_path;
+            st.log_button = true;
+        } else {
+            st.title  = "Starting engine…";
+            st.detail = "Log: " + g_engine_log_path;
+        }
+#else
+        if (reach == -1) return st;
+        st.title  = "Engine not running";
+        st.detail = "Start it with: sudo ./host-c/cdhost";
+#endif
+        st.active = true;
+        return st;
+    }
+    if (g_usbmuxd_ok == 0) {
+        st.active = true;
+        st.title  = "Can't reach the iPhone USB service";
+        st.detail = g_usbmuxd_error.empty() ? std::string("usbmuxd is not running.") : g_usbmuxd_error;
+#ifdef _WIN32
+        st.store_button = true;
+#endif
+        return st;
+    }
+    if (!g_bound_udid.empty()) return st;
+    if (g_engine_state == "binding") {
+        std::string name = "iPhone";
+        if (g_selected_device_idx >= 0 && g_selected_device_idx < (int)g_devices.size())
+            name = g_devices[g_selected_device_idx].display_name();
+        st.active = true;
+        st.title  = "Connecting to " + name + "…";
+    } else if (g_engine_state == "waiting_for_device") {
+        st.active = true;
+        st.title  = "Connect an iPhone with USB and tap Trust";
+    }
+    /* The engine's last bring-up failure ("<udid>: <reason>"), present only while not ready. */
+    if (st.active && !g_engine_bringup_error.empty() && g_engine_state != "ready")
+        st.detail = "Last attempt: " + g_engine_bringup_error;
+    return st;
+}
+
+#ifdef _WIN32
+static void open_apple_devices_in_store()
+{
+    ShellExecuteW(main_window_hwnd(), L"open", L"ms-windows-store://pdp/?productid=9NP83LWLPZ9K",
+                  nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static void open_engine_log()
+{
+    std::wstring p = utf8_to_w(g_engine_log_path);
+    ShellExecuteW(main_window_hwnd(), L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+#endif
+
 static void render_sidebar(float height)
 {
     if (g_sidebar_hidden) return;
@@ -2557,7 +3262,7 @@ static void render_sidebar(float height)
         if (double_clicked) {
             g_view_screen = true;
             g_focused_pane = FocusPane::Stage;
-            api_async("activate", {});
+            activate_device();
         }
         if (ImGui::BeginPopupContextItem("DeviceContextMenu")) {
             g_selected_device_idx = i;
@@ -2624,15 +3329,21 @@ static void render_sidebar(float height)
     }
 
     if (listed_devices == 0) {
+        const StageStatus st = stage_status();
         ImGui::Spacing();
         ImGui::TextColored(rplayhub::Theme::ColorTextSecondary, "No devices found");
-        ImGui::TextColored(rplayhub::Theme::ColorTextTertiary, "Plug in USB & start cdhost");
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 230.0f * s);
+        ImGui::TextColored(rplayhub::Theme::ColorTextTertiary, "%s",
+                           st.active ? st.title.c_str() : "Plug in USB & start cdhost");
+        ImGui::PopTextWrapPos();
     }
 
     /* Bottom status bar matching gui_app.cc lines 2402-2412 */
     ImGui::SetCursorPos(ImVec2(12.0f * s, height - 30.0f * s));
     char status_txt[128];
-    if (g_devices.empty()) {
+    if (g_engine_reachable.load() == 0) {
+        snprintf(status_txt, sizeof status_txt, "cdhost %d — not running", g_api_port);
+    } else if (g_devices.empty()) {
         snprintf(status_txt, sizeof status_txt, "cdhost %d — no devices", g_api_port);
     } else {
         snprintf(status_txt, sizeof status_txt, "cdhost %d — %zu %s",
@@ -2778,7 +3489,10 @@ static void render_phone_mockup(ImVec2 center, ImVec2 max_size, bool popped_out)
     /* Device label + iOS version below mockup */
     std::string dev_label = "No device selected";
     std::string sub_label;
-    if (!g_bound_name.empty()) {
+    const StageStatus status = stage_status();
+    if (status.active && !popped_out) {
+        dev_label = status.title;
+    } else if (!g_bound_name.empty()) {
         dev_label = g_bound_name;
         if (!g_bound_os_version.empty()) sub_label = "iOS " + g_bound_os_version;
     } else if (g_selected_device_idx >= 0 && g_selected_device_idx < (int)g_devices.size()) {
@@ -2799,6 +3513,48 @@ static void render_phone_mockup(ImVec2 center, ImVec2 max_size, bool popped_out)
         dl->AddText(g_font_caption, 12.5f * s, ImVec2(center.x - ssz.x * 0.5f, text_y),
                     IM_COL32(120, 120, 128, 255), sub_label.c_str());
         text_y += ssz.y + 4.0f * s;
+    }
+
+    /* First-run / engine status replaces the "View Screen" pill while there is nothing to view. */
+    if (status.active && !popped_out) {
+        const float wrap_w = std::max(160.0f * s, std::min(max_size.x - 40.0f * s, 460.0f * s));
+        size_t start = 0;
+        while (start <= status.detail.size() && !status.detail.empty()) {
+            size_t nl = status.detail.find('\n', start);
+            std::string line = status.detail.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+            ImVec2 lsz = g_font_caption->CalcTextSizeA(12.5f * s, FLT_MAX, wrap_w, line.c_str());
+            dl->AddText(g_font_caption, 12.5f * s, ImVec2(center.x - lsz.x * 0.5f, text_y),
+                        IM_COL32(120, 120, 128, 255), line.c_str(), nullptr, wrap_w);
+            text_y += lsz.y + 2.0f * s;
+            if (nl == std::string::npos) break;
+            start = nl + 1;
+        }
+#ifdef _WIN32
+        float bw = 0.0f;
+        const char *b1 = status.store_button ? "Get Apple Devices" : status.log_button ? "Retry" : nullptr;
+        const char *b2 = status.log_button ? "Open Log" : nullptr;
+        if (b1) bw += ImGui::CalcTextSize(b1).x + 32.0f * s;
+        if (b2) bw += ImGui::CalcTextSize(b2).x + 32.0f * s + 8.0f * s;
+        if (bw > 0.0f) {
+            ImGui::SetCursorScreenPos(ImVec2(center.x - bw * 0.5f, text_y + 10.0f * s));
+            if (b1 && ImGui::Button(b1, ImVec2(ImGui::CalcTextSize(b1).x + 32.0f * s, 30.0f * s))) {
+                if (status.store_button) open_apple_devices_in_store();
+                else g_engine_retry = true;
+            }
+            if (b2) {
+                if (b1) ImGui::SameLine(0, 8.0f * s);
+                if (ImGui::Button(b2, ImVec2(ImGui::CalcTextSize(b2).x + 32.0f * s, 30.0f * s))) open_engine_log();
+            }
+        }
+#endif
+        return;
+    }
+    if (!g_ddi_error.empty() && !popped_out) {
+        const float wrap_w = std::max(160.0f * s, std::min(max_size.x - 40.0f * s, 460.0f * s));
+        ImVec2 esz = g_font_caption->CalcTextSizeA(12.5f * s, FLT_MAX, wrap_w, g_ddi_error.c_str());
+        dl->AddText(g_font_caption, 12.5f * s, ImVec2(center.x - esz.x * 0.5f, text_y),
+                    IM_COL32(200, 60, 50, 255), g_ddi_error.c_str(), nullptr, wrap_w);
+        text_y += esz.y + 4.0f * s;
     }
 
     /* "View Screen" Pill Button (matching macOS MirrorView.swift & Android GuiApp::renderPhoneMockup) */
@@ -2830,7 +3586,7 @@ static void render_phone_mockup(ImVec2 center, ImVec2 max_size, bool popped_out)
             g_popout_win->requestClose("Bring Back");
         } else {
             g_view_screen = true;
-            api_async("activate", {});
+            activate_device();
         }
     }
 }
@@ -2982,8 +3738,26 @@ static void render_twin_stage(ImVec2 origin, ImVec2 size)
         g_twin.setFold(false, 180.0f, false);
     }
 
-    int dw = g_vtex_w > 0 ? g_vtex_w : 1170;
-    int dh = g_vtex_h > 0 ? g_vtex_h : 2532;
+    /* Same crop as the 2D mirror (render_live_mirror): only g_vtex_uv0..uv1 of the coded texture
+     * is screen -- the rest is alignment padding, or on a reduced RVRA tier the unused area around
+     * the squeezed picture. The slab takes the screen's real proportions (model size when known,
+     * like the 2D view, so a downshift does not reshape it), and hitTest answers in those same
+     * dw x dh units, so tx/dw is a fraction of the visible screen -- what "tap" wants. Dividing by
+     * the coded size instead put every tap up to 1.2% off, and up to 25% off on a reduced tier. */
+    int dw = 1170, dh = 2532;
+    {
+        int model_w = g_bound_screen_w, model_h = g_bound_screen_h;
+        if ((model_w <= 0 || model_h <= 0) && !g_bound_product_type.empty()) {
+            if (const auto *m = lookup_device_model(g_bound_product_type)) {
+                model_w = m->screen_w;
+                model_h = m->screen_h;
+            }
+        }
+        if (model_w > 0 && model_h > 0) { dw = model_w; dh = model_h; }
+        else if (g_live_w > 0 && g_live_h > 0) { dw = g_live_w; dh = g_live_h; }
+        else if (g_vtex_w > 0 && g_vtex_h > 0) { dw = g_vtex_w; dh = g_vtex_h; }
+    }
+    g_twin.setScreenCrop(g_vtex_uv1.x, g_vtex_uv1.y);
     g_twin.render(dl, origin, size, (ImTextureID)(intptr_t)g_vtex, (ImTextureID)(intptr_t)g_back_texture,
                   dw, dh, g_rotation, s, 0, g_ren, 0);
 
@@ -3397,7 +4171,7 @@ static void render_report_group(float width, float height)
                 IM_COL32(28, 28, 30, 255), "Device Reports");
     ImGui::SameLine(width - 126.0f * s);
     if (ImGui::Button("Export All", ImVec2(82.0f * s, 26.0f * s))) {
-        std::string dir = ensure_media_dir("Downloads") + "/crashes";
+        std::string dir = ensure_media_dir("Downloads") + kPathSep + "crashes";
         mkdir(dir.c_str(), 0755);
         show_toast("Exporting crash reports…", 10000);
         api_async("export_crashes", {{"dir", dir}}, [dir](const json &r) {
@@ -3614,15 +4388,23 @@ static void render_info_subtab_device(float width, float avail_h)
 
     /* Live Stream section from stream_info */
     std::vector<std::pair<std::string, std::string>> stream_rows;
-    stream_rows.push_back({"Video Stream", g_stream_connected ? (g_h264 ? "Connected (H.264)" : "Connected (HEVC)") : "Disconnected"});
+    /* The engine accepts and holds a viewer before any device is bound, so a connected socket with
+     * nothing decoded yet is "waiting", not a stream. */
+    const char *vs_state = !g_stream_connected ? "Disconnected"
+                         : (!g_engine_state.empty() && g_engine_state != "ready") ? "Waiting for device"
+                         : !frames_recent() ? (g_h264 ? "Connected (H.264), no frames" : "Connected (HEVC), no frames")
+                         : g_h264 ? "Connected (H.264)" : "Connected (HEVC)";
+    stream_rows.push_back({"Video Stream", vs_state});
     if (g_vtex_w > 0 && g_vtex_h > 0) {
         stream_rows.push_back({"Active Picture", std::to_string(g_vtex_w) + "\xc3\x97" + std::to_string(g_vtex_h)});
     }
     stream_rows.push_back({"Frames Decoded", std::to_string(g_frames_decoded.load())});
-    float cur_fps = g_live_fps.load();
-    if (cur_fps > 0.0f) {
+    if (g_decode_errors.load() > 0)
+        stream_rows.push_back({"Decode Errors", std::to_string(g_decode_errors.load())});
+    {
+        /* Always shown, and live: 0 once frames stop, instead of the last rate frozen in place. */
         char fbuf[32];
-        snprintf(fbuf, sizeof fbuf, "%.1f FPS", cur_fps);
+        snprintf(fbuf, sizeof fbuf, "%.1f FPS", live_fps_now());
         stream_rows.push_back({"Framerate", fbuf});
     }
     if (g_stream_info.is_object() && !g_stream_info.empty()) {
@@ -4130,8 +4912,10 @@ static void render_info_subtab_controls(float width, float avail_h)
     // Section 2: Live Stream Diagnostics (matching ControlPanel.swift lines 85-98)
     std::vector<std::pair<std::string, std::string>> diag_rows;
     char fps_buf[64], br_buf[64], res_buf[64];
-    float cur_fps = g_live_fps.load();
-    snprintf(fps_buf, sizeof fps_buf, "%.1f FPS (negotiated 60 FPS)", cur_fps > 0.0f ? cur_fps : 60.0f);
+    /* The measured rate, 0 when nothing is decoding -- not the negotiated 60 dressed up as a
+     * measurement. */
+    float cur_fps = live_fps_now();
+    snprintf(fps_buf, sizeof fps_buf, "%.1f FPS (negotiated 60 FPS)", cur_fps);
     double mbps = (g_stream_info.is_object() && g_stream_info.contains("mbps")) ? g_stream_info.value("mbps", 0.0) : 0.0;
     snprintf(br_buf, sizeof br_buf, "%.2f Mbps (cap 15.0 Mbps)", mbps > 0.01 ? mbps : 0.0);
     snprintf(res_buf, sizeof res_buf, "%d × %d", g_vtex_w, g_vtex_h);
@@ -4139,8 +4923,14 @@ static void render_info_subtab_controls(float width, float avail_h)
     diag_rows.push_back({"Framerate", fps_buf});
     diag_rows.push_back({"Bitrate", br_buf});
     diag_rows.push_back({"Coded Resolution", res_buf});
-    diag_rows.push_back({"Video Codec", "HEVC / H.265 (Low Latency D3D11/DXVA2)"});
-    diag_rows.push_back({"Audio Stream", "AAC-ELD 44.1 kHz Stereo"});
+    /* What is actually in use, not what we hope is: the codec the engine negotiated, the renderer
+     * SDL created, and FFmpeg's software decoder (the RVRA patch is what keeps it correct). */
+    const char *rvra_env = getenv("RPLAY_RVRA");
+    const bool rvra_on = !rvra_env || atoi(rvra_env) != 0;
+    diag_rows.push_back({"Video Codec", g_h264 ? "H.264 / AVC" : "HEVC / H.265"});
+    diag_rows.push_back({"Decoder", std::string("FFmpeg software, RVRA ") + (rvra_on ? "on" : "off")});
+    diag_rows.push_back({"Renderer", g_renderer_name.empty() ? "unknown" : "SDL " + g_renderer_name});
+    diag_rows.push_back({"Audio Stream", "AAC-ELD 48 kHz stereo"});
     if (g_stream_info.is_object()) {
         diag_rows.push_back({"Stream Uptime", std::to_string(g_stream_info.value("uptime_s", 0)) + " s"});
         diag_rows.push_back({"Total Frames", std::to_string(g_stream_info.value("total_frames", (uint64_t)0))});
@@ -4399,8 +5189,19 @@ static void render_modals_and_toast(int win_w, int win_h)
 /* =========================================================================
  * 17. Main Entry Point
  * ========================================================================= */
+static const char kUsage[] =
+    "usage: %s [-h host] [-p video_port] [-A api_port] [--no-audio] [-r 0|1] [-scale F] "
+    "[--system-titlebar] [--auto-connect]"
+#ifdef _WIN32
+    " [--no-engine]"
+#endif
+    "\n";
+
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    win_setup_stdio();
+#endif
     int rvra = 1;
     int audio = 1;
     float cli_scale = 0.0f;
@@ -4418,12 +5219,16 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-scale") && i + 1 < argc) cli_scale = std::strtof(argv[++i], nullptr);
         else if (!strcmp(argv[i], "--system-titlebar")) g_system_titlebar = true;
         else if (!strcmp(argv[i], "--auto-connect")) g_view_screen = true;
+        else if (!strcmp(argv[i], "--no-engine")) g_engine_spawn = false;
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [-h host] [-p video_port] [-A api_port] [--no-audio] [-r 0|1] [-scale F] [--system-titlebar] [--auto-connect]\n", argv[0]);
+            printf(kUsage, argv[0]);
+#ifdef _WIN32
+            printf("  --no-engine   do not start cdhost.exe; use one that is already running\n");
+#endif
             return 0;
         }
         else {
-            fprintf(stderr, "usage: %s [-h host] [-p video_port] [-A api_port] [--no-audio] [-r 0|1] [-scale F] [--system-titlebar] [--auto-connect]\n", argv[0]);
+            fprintf(stderr, kUsage, argv[0]);
             return 2;
         }
     }
@@ -4431,6 +5236,13 @@ int main(int argc, char **argv)
 
     SDL_SetHint(SDL_HINT_VIDEO_HIGHDPI_DISABLED, "0");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+#ifdef _WIN32
+    /* The manifest already makes the process per-monitor-v2 DPI aware; tell SDL the same so it
+     * does not try to change it. Window sizes stay in physical pixels (no SDL DPI scaling: ImGui
+     * would then rasterise fonts at the logical size and stretch them); g_scale below follows the
+     * monitor's scale factor instead. */
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -4442,15 +5254,16 @@ int main(int argc, char **argv)
     SDL_GetCurrentDisplayMode(0, &dm);
     if (cli_scale > 0.25f) {
         g_scale = std::clamp(cli_scale, 0.75f, 3.0f);
+#ifdef _WIN32
+    } else {
+        /* Windows has a real per-monitor scale factor (Settings > Display > Scale): use it. */
+        g_scale = win_display_scale(0);
+    }
+#else
     } else if (dm.w >= 3000 || dm.h >= 1800) {
         g_scale = 1.5f;   /* 4K / HiDPI display */
     } else if (dm.w >= 2400 || dm.h >= 1400) {
         g_scale = 1.3f;   /* QHD / 1440p display */
-#ifdef _WIN32
-    } else {
-        g_scale = 1.0f;
-    }
-#else
     } else {
         g_scale = 1.15f;  /* 1080p display — slightly boosted for crispness */
     }
@@ -4462,11 +5275,18 @@ int main(int argc, char **argv)
     if (dm.h > 0 && init_h > dm.h - 80) init_h = dm.h - 80;
     Uint32 win_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #ifndef _WIN32
-    if (!g_system_titlebar && !argb_vis.empty()) win_flags |= SDL_WINDOW_OPENGL;
+    /* Linux/macOS: as before the Windows renderer work -- always an OpenGL window, which is what
+     * the X11 ARGB visual (rounded, transparent corners) renders through. */
+    win_flags |= SDL_WINDOW_OPENGL;
 #endif
     if (!g_system_titlebar) win_flags |= SDL_WINDOW_BORDERLESS;
 
     const std::string argb_vis = g_system_titlebar ? "" : rplayhub::argbVisualId();
+#ifdef _WIN32
+    /* Direct3D 11, not whatever SDL ranks first (it can pick D3D9). Applies to the pop-out
+     * window's renderer too. Cleared below if it cannot be created here. */
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+#endif
     for (int attempt = 0; attempt < 2 && !g_ren; attempt++) {
         bool try_argb = (attempt == 0 && !argb_vis.empty());
         if (attempt == 1 && argb_vis.empty()) break;
@@ -4475,6 +5295,13 @@ int main(int argc, char **argv)
                                  init_w, init_h, win_flags);
         if (g_win) {
             g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+#ifdef _WIN32
+            if (!g_ren) {
+                fprintf(stderr, "direct3d11 renderer unavailable (%s); using SDL's default\n", SDL_GetError());
+                SDL_SetHint(SDL_HINT_RENDER_DRIVER, "");
+                g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+            }
+#endif
             if (!g_ren) g_ren = SDL_CreateRenderer(g_win, -1, 0);
         }
         if (try_argb) SDL_SetHint(SDL_HINT_VIDEO_X11_WINDOW_VISUALID, "");
@@ -4492,6 +5319,7 @@ int main(int argc, char **argv)
     SDL_RendererInfo rinfo;
     if (SDL_GetRendererInfo(g_ren, &rinfo) == 0) {
         has_vsync = (rinfo.flags & SDL_RENDERER_PRESENTVSYNC) != 0;
+        g_renderer_name = rinfo.name ? rinfo.name : "";
         printf("SDL renderer: %s%s, video driver: %s\n",
                rinfo.name ? rinfo.name : "unknown",
                has_vsync ? " (vsync)" : "",
@@ -4533,9 +5361,11 @@ int main(int argc, char **argv)
     {
         static float pop_fx0 = 0.0f, pop_fy0 = 0.0f;
         static uint64_t pop_t0 = 0;
+        /* DisplayWindow reports touches in its frame's displayWidth x displayHeight -- the
+         * CROPPED picture (upload_latest_video_frame), not the coded texture. */
         g_popout_session.on_touch = [](int x, int y, int action, int32_t) {
-            float dw = (float)std::max(1, g_vtex_w);
-            float dh = (float)std::max(1, g_vtex_h);
+            float dw = (float)std::max(1, g_popout_frame.displayWidth > 0 ? g_popout_frame.displayWidth : g_vtex_w);
+            float dh = (float)std::max(1, g_popout_frame.displayHeight > 0 ? g_popout_frame.displayHeight : g_vtex_h);
             float fx = std::clamp(x / dw, 0.0f, 1.0f);
             float fy = std::clamp(y / dh, 0.0f, 1.0f);
             if (action == rplayhub::MotionAction::DOWN) {
@@ -4549,8 +5379,8 @@ int main(int argc, char **argv)
         };
         g_popout_session.on_scroll = [](int x, int y, float, float wy, int32_t) {
             if (std::fabs(wy) < 0.05f) return;
-            float fx = std::clamp((float)x / (float)std::max(1, g_vtex_w), 0.0f, 1.0f);
-            float fy = std::clamp((float)y / (float)std::max(1, g_vtex_h), 0.0f, 1.0f);
+            float fx = std::clamp((float)x / (float)std::max(1, g_popout_frame.displayWidth > 0 ? g_popout_frame.displayWidth : g_vtex_w), 0.0f, 1.0f);
+            float fy = std::clamp((float)y / (float)std::max(1, g_popout_frame.displayHeight > 0 ? g_popout_frame.displayHeight : g_vtex_h), 0.0f, 1.0f);
             float fy1 = std::clamp(fy + (wy > 0.0f ? 0.22f : -0.22f), 0.05f, 0.95f);
             api_async("swipe", {{"fx0", fx}, {"fy0", fy}, {"fx1", fx}, {"fy1", fy1}, {"duration_ms", 180}});
         };
@@ -4574,6 +5404,9 @@ int main(int argc, char **argv)
     discover_fonts();
     rebuild_fonts();
 
+#ifdef _WIN32
+    std::thread engine_thr = engine_start_supervisor();
+#endif
     std::thread vthr(video_thread_main);
     if (audio) audio_start(g_host, g_api_port + 2);
     refresh_devices();
@@ -4613,6 +5446,19 @@ int main(int argc, char **argv)
                        ev.window.windowID == SDL_GetWindowID(g_win) &&
                        ev.window.event == SDL_WINDOWEVENT_CLOSE) {
                 g_quit = true;
+#ifdef _WIN32
+            } else if (ev.type == SDL_WINDOWEVENT &&
+                       ev.window.windowID == SDL_GetWindowID(g_win) &&
+                       ev.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED && cli_scale <= 0.25f) {
+                /* Moved to a monitor with a different scale factor: re-layout at its scale. */
+                float ns = win_display_scale(ev.window.data1);
+                if (std::fabs(ns - g_scale) > 0.01f) {
+                    g_scale = ns;
+                    rplayhub::Theme::applyMacStyle(g_scale);
+                    g_fonts_dirty = true;
+                    SDL_SetWindowMinimumSize(g_win, (int)std::lround(760.0f * g_scale), (int)std::lround(520.0f * g_scale));
+                }
+#endif
             } else if (ev.type == SDL_DROPFILE && ev.drop.file) {
                 std::string dropped = ev.drop.file;
                 SDL_free(ev.drop.file);
@@ -4625,6 +5471,19 @@ int main(int argc, char **argv)
 
         /* Periodic background polls: device list (every 3s), stream_info (every 2s when Info tab open) */
         uint64_t now = now_ms();
+
+        /* The engine is gone: what it last told us is no longer true. The sidebar kept its green
+         * "bound" dot and Info its last stream numbers while the footer said "not running". A
+         * short grace period keeps one missed probe from reloading every panel. */
+        {
+            static uint64_t s_unreachable_since = 0;
+            if (g_engine_reachable.load() == 0) {
+                if (!s_unreachable_since) s_unreachable_since = now;
+                if (now - s_unreachable_since >= 1500) forget_engine_session();
+            } else {
+                s_unreachable_since = 0;
+            }
+        }
         if (now - g_last_dev_poll_ms >= 3000) {
             g_last_dev_poll_ms = now;
             refresh_devices();
@@ -4634,6 +5493,7 @@ int main(int argc, char **argv)
             g_last_stream_poll_ms = now;
             api_async("stream_info", {}, [](const json &r) {
                 if (r.value("ok", false)) g_stream_info = r["result"];
+                else g_stream_info = json::object();   /* never show a dead engine's numbers */
             }, 3);
         }
 
@@ -4697,6 +5557,10 @@ int main(int argc, char **argv)
 
     stop_syslog();
     vthr.join();
+#ifdef _WIN32
+    engine_thr.join();
+    engine_shutdown();
+#endif
 
     g_popout_win.reset();
     for (auto &kv : g_app_icon_cache) {
