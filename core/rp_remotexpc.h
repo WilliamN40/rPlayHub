@@ -71,6 +71,22 @@ typedef struct {
     size_t     window_used;
     /* How much was needed when a reply overflowed, so the caller can say by how much. */
     size_t     overflow_needed;
+
+    /* Outbound flow control -- what the PEER lets us send. Only rp_rxpc_send_file is gated by it
+     * (requests are a few hundred bytes), but every DATA frame we write is charged against it, or
+     * a later file transfer overruns the connection window by that much and the device answers
+     * GOAWAY FLOW_CONTROL_ERROR. HTTP/2 defaults until the peer's SETTINGS/WINDOW_UPDATE say
+     * otherwise. */
+    int64_t    out_conn_window;
+    int64_t    peer_initial_window;
+    struct { uint32_t stream; int64_t window; } out_streams[16];
+    int        out_stream_count;
+    /* Client-initiated file-transfer streams are odd; 1 and 3 are taken. */
+    uint32_t   next_file_stream;
+    /* A complete reply that arrived while rp_rxpc_send_file was waiting for window; handed out by
+     * the next rp_rxpc_recv. */
+    int        has_pending;
+    rp_xpc_obj pending;
 } rp_rxpc_session;
 
 /* Bind a session to a transport. The two buffers are caller-owned and must outlive the session;
@@ -92,6 +108,15 @@ int rp_rxpc_send(rp_rxpc_session *s, const uint8_t *body, size_t body_len, int w
  * receive loop must skip them or it will mistake one for the reply. Returns 0 on success and
  * leaves `obj` pointing into the session's reassembly buffer, valid until the next call. */
 int rp_rxpc_recv(rp_rxpc_session *s, rp_xpc_obj *obj);
+
+/* Push the bytes of a file transfer announced earlier in a request (rp_xpc_file_transfer with the
+ * same `transfer_id`). They travel on a fresh client-initiated stream (5, 7, 9...): HEADERS, a
+ * DATA preamble that is an empty wrapper with FILE_TX_STREAM_REQUEST and message_id=transfer_id
+ * (how the device pairs stream and announcement), the payload in window-sized DATA frames, then an
+ * empty DATA with END_STREAM. Blocks reading the peer's WINDOW_UPDATEs whenever the window is
+ * spent. The device resets the stream once it has the bytes; rp_rxpc_recv ignores that. Ported
+ * from pymobiledevice3's RemoteXPCConnection.send_file_transfer. Returns 0 on success. */
+int rp_rxpc_send_file(rp_rxpc_session *s, uint64_t transfer_id, const uint8_t *data, size_t len);
 
 #ifdef __cplusplus
 }

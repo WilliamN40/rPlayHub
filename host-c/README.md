@@ -120,7 +120,9 @@ refused there -- there is no kernel tunnel path), and Apple Mobile Device Servic
 - Listeners use `SO_EXCLUSIVEADDRUSE`, so a second `cdhost.exe` fails to bind and exits.
 - **DDI** lookup order: `RPLAY_DDI`, then `%LOCALAPPDATA%\rplayhub\iOS_DDI`, then `iOS_DDI\`
   beside `cdhost.exe`, then `..\deps\iOS_DDI` relative to it, then `$XDG_DATA_HOME`/`$HOME`
-  (`.local/share/rplayhub/iOS_DDI`).
+  (`.local/share/rplayhub/iOS_DDI`). In each, the Cryptex DDI (iOS 27, installed through cryptexd)
+  is looked for in `Cryptex\` and then in a `Restore\` manifest with the cryptex identity; the
+  personalized DDI in `Restore\`. See `doc/DDI.md`.
 - `RPLAY_ATTACH_TUNNEL` is macOS-only (it parses `ifconfig` for a utun) and is refused on Windows.
 - The 30 s bring-up watchdog is a thread on every platform now (no `alarm()`), and relaunches the
   engine rather than exiting; it exits with code 2 only if that relaunch fails.

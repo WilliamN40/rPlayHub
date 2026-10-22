@@ -22,7 +22,7 @@ endif
 HEVC_SAMPLE ?= ../screen3.h265
 H264_SAMPLE ?= ../build/screen3.h264
 
-TESTS := test_rp_video_stream test_rp_xpc test_rp_remotexpc test_rp_media_offer test_rp_rtp test_rp_bigreply
+TESTS := test_rp_video_stream test_rp_xpc test_rp_remotexpc test_rp_media_offer test_rp_rtp test_rp_bigreply test_rp_filexfer
 BINS  := $(addsuffix $(EXE),$(TESTS))
 
 all: $(BINS)
@@ -45,6 +45,9 @@ test_rp_rtp$(EXE): test_rp_rtp.c rp_rtp.c
 test_rp_bigreply$(EXE): test_rp_bigreply.c rp_remotexpc.c rp_xpc.c rp_http2.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+test_rp_filexfer$(EXE): test_rp_filexfer.c rp_remotexpc.c rp_xpc.c rp_http2.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 # `make test_rp_xpc` etc. keep working on Windows as aliases for the .exe targets.
 ifneq ($(EXE),)
 $(TESTS): %: %$(EXE)
@@ -57,6 +60,7 @@ test: $(BINS)
 	@./test_rp_xpc$(EXE) >/dev/null && echo "  encoder + reader OK (byte-compare against Python: scripts/check-xpc.sh)"
 	@./test_rp_remotexpc$(EXE) | tail -6
 	@./test_rp_bigreply$(EXE)
+	@./test_rp_filexfer$(EXE)
 	@../scripts/check-handshake.sh || true
 	@echo "core/rp_media_offer + rp_rtp (byte-compared against the Python and a real capture)"
 	@../scripts/check-offer.sh || true

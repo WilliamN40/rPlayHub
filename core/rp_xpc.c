@@ -144,6 +144,19 @@ void rp_xpc_null(rp_xpc_writer *w)
     bump(w); put_u32(w, RP_XPC_NULL);
 }
 
+void rp_xpc_file_transfer(rp_xpc_writer *w, uint64_t transfer_id, uint64_t size)
+{
+    /* Counted as ONE entry of the enclosing container: the inner dictionary is part of this
+     * object's payload, so the bump container_begin does on it is undone. */
+    bump(w);
+    put_u32(w, RP_XPC_FILE_TRANSFER);
+    put_u64(w, transfer_id);
+    rp_xpc_dict_begin(w);
+    if (w->depth >= 2) w->counts[w->depth - 2]--;
+    rp_xpc_set_uint64(w, "s", size);
+    rp_xpc_dict_end(w);
+}
+
 void rp_xpc_set_string(rp_xpc_writer *w, const char *k, const char *v)
 { rp_xpc_key(w, k); rp_xpc_string(w, v); }
 void rp_xpc_set_uint64(rp_xpc_writer *w, const char *k, uint64_t v)
@@ -247,6 +260,13 @@ static size_t obj_size(const uint8_t *p, size_t avail)
     case RP_XPC_DOUBLE:
     case RP_XPC_DATE:   return avail >= 12 ? 12 : 0;
     case RP_XPC_UUID:   return avail >= 20 ? 20 : 0;
+    case RP_XPC_FD:     return avail >= 8 ? 8 : 0;
+    case RP_XPC_FILE_TRANSFER: {
+        /* type + u64 transfer id + one nested object (a dictionary). */
+        if (avail < 12) return 0;
+        size_t inner = obj_size(p + 12, avail - 12);
+        return inner ? 12 + inner : 0;
+    }
     case RP_XPC_STRING:
     case RP_XPC_DATA: {
         if (avail < 8) return 0;

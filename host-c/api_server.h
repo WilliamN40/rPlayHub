@@ -68,6 +68,9 @@ int imd_pick_device(const api_device *devs, int n, const char *want);
  * Guarded by a 30 s watchdog that exits the process if a library call hangs (see imd.c). */
 int imd_bringup(const char *want, void **out_conn, char *udid_out, size_t udidlen,
                 char *devname, size_t dnlen, char *prodver, size_t pvlen);
+/* Why the last imd_bringup failed, phrased for the user ("" when there is nothing specific):
+ * locked, waiting for Trust, Trust declined, Developer Mode off. */
+const char *imd_last_error(void);
 int imd_conn_send(void *conn, const void *buf, size_t n);
 int imd_conn_recv(void *conn, void *buf, size_t n);
 /* Drop a connection imd_bringup returned (and the device handle it rides on), when bring-up fails
@@ -110,6 +113,7 @@ typedef struct {
     long        crashcopy_port;       /* crashreportcopymobile.shim.remote: AFC over crash reports */
     long        crashmover_port;      /* crashreportmover.shim.remote: poke before listing */
     long        mounter_port;         /* mobile_image_mounter.shim.remote: DDI self-activation */
+    long        cryptexd_port;        /* security.cryptexd.remote: the iOS 27 Cryptex DDI install */
     long        sbservices_port;      /* springboardservices.shim.remote: per-app icon PNGs */
     /* Candidates for Device Hub's Settings tab (appearance/accessibility actions). Which of these
      * actually answers them is not yet known -- see doc/COREDEVICE-ACTIONS.md -- so all three are

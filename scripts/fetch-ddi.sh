@@ -9,7 +9,10 @@
 # On a Mac with Xcode (or Device Hub) installed there is nothing to do: the engine finds Xcode's
 # copy in /Library/Developer/DeveloperDiskImages/iOS_DDI. Everywhere else -- Linux, a Mac without
 # Xcode -- this fetches the same files from doronz88/DeveloperDiskImage, the public mirror that
-# pymobiledevice3 downloads from, into the folder the engine looks in:
+# pymobiledevice3 downloads from, into the folder the engine looks in. Both variants are fetched:
+# the Cryptex DDI (iOS 27, installed through cryptexd; the only one Apple signs for phones newer
+# than the DDI, e.g. the iPhone 18 series) into <dest>/Cryptex, and the personalized DDI
+# (iOS 17-26) into <dest>/Restore:
 #
 #   ./scripts/fetch-ddi.sh                 # -> ~/.local/share/rplayhub/iOS_DDI
 #   ./scripts/fetch-ddi.sh /some/dir       # -> /some/dir, then run the engine with RPLAY_DDI=/some/dir
@@ -19,24 +22,36 @@ set -euo pipefail
 
 DEST="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/rplayhub/iOS_DDI}"
 REF="${DDI_REF:-main}"
-BASE="https://github.com/doronz88/DeveloperDiskImage/raw/$REF/PersonalizedImages/Xcode_iOS_DDI_Personalized"
+IMAGES="https://github.com/doronz88/DeveloperDiskImage/raw/$REF/PersonalizedImages"
 
-# The engine reads <dir>/Restore/BuildManifest.plist and takes the image and trust-cache paths
-# from the manifest, which in this copy are Image.dmg and Image.dmg.trustcache.
-mkdir -p "$DEST/Restore"
-for f in BuildManifest.plist Image.dmg Image.dmg.trustcache; do
-    echo "fetching $f"
-    curl -fL --retry 3 -o "$DEST/Restore/$f.part" "$BASE/$f"
-    mv "$DEST/Restore/$f.part" "$DEST/Restore/$f"
-done
+# fetch <url> <dir> <files...> -- the manifest goes last: a folder with a manifest is one the
+# engine will try to use, so it must not appear before the files it names are complete.
+fetch() {
+    local url="$1" dir="$2"; shift 2
+    mkdir -p "$dir"
+    for f in "$@"; do
+        echo "fetching $(basename "$dir")/$f"
+        curl -fL --retry 3 -o "$dir/$f.part" "$url/$f"
+        mv "$dir/$f.part" "$dir/$f"
+    done
+}
 
-build=""
-if command -v python3 >/dev/null; then
-    build=$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("ProductBuildVersion",""))' \
-            "$DEST/Restore/BuildManifest.plist" 2>/dev/null || true)
-fi
+# The Cryptex DDI: <dir>/Cryptex/BuildManifest.plist, whose "Developer Disk Image Cryptex" identity
+# names the other four files. They share names with the personalized files, hence their own folder.
+fetch "$IMAGES/Xcode_iOS_DDI_Cryptex" "$DEST/Cryptex" \
+    Image.dmg Image.dmg.trustcache Image.dmg.cryptex_info Image.dmg.root_hash BuildManifest.plist
+
+# The personalized DDI: <dir>/Restore/BuildManifest.plist; the engine takes the image and
+# trust-cache paths from the manifest, which in this copy are Image.dmg and Image.dmg.trustcache.
+fetch "$IMAGES/Xcode_iOS_DDI_Personalized" "$DEST/Restore" Image.dmg Image.dmg.trustcache BuildManifest.plist
+
+build_of() {
+    command -v python3 >/dev/null || { echo "?"; return; }
+    python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("ProductBuildVersion","?"))' \
+            "$1/BuildManifest.plist" 2>/dev/null || echo "?"
+}
 echo
-echo "DDI ${build:+build $build }in $DEST"
+echo "DDI in $DEST -- Cryptex build $(build_of "$DEST/Cryptex"), personalized build $(build_of "$DEST/Restore")"
 case "$DEST" in
     "${XDG_DATA_HOME:-$HOME/.local/share}/rplayhub/iOS_DDI") echo "the engine finds it there on its own." ;;
     *) echo "run the engine with RPLAY_DDI=$DEST" ;;

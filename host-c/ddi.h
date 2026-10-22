@@ -25,6 +25,21 @@
  * RP_DDI_ALREADY when an image is already mounted. Writes progress to stderr. */
 int cdhost_ddi_activate(const char *tunnel_addr, long mounter_port, const char *ddi_dir);
 
+/* Install the Cryptex DDI through cryptexd (com.apple.security.cryptexd.remote at `cryptexd_port`):
+ * the iOS 27 path, and the only one for phones newer than the DDI's manifest. `mounter_port` (may
+ * be 0) is only asked whether a personalized image already holds the mount point. RP_DDI_NO_DDI
+ * when the Cryptex files are not found (<dir>/Cryptex or a Restore manifest with the cryptex
+ * identity, in the same directories as above). Writes progress, Apple's refusal text and
+ * cryptexd's error text to stderr. RPLAY_TSS_DUMP=<file> saves the ticket request;
+ * RPLAY_TSS_DRYRUN=1 stops before contacting Apple. */
+int cdhost_ddi_install_cryptex(const char *tunnel_addr, long cryptexd_port, long mounter_port, const char *ddi_dir);
+
+/* The DDI step the engine and the activate_ddi API run: the Cryptex DDI from iOS 27 when cryptexd is
+ * advertised (falling back to the personalized image when the Cryptex files are missing), the
+ * personalized image below that -- pymobiledevice3's auto_mount. */
+int cdhost_ddi_auto(const char *tunnel_addr, long mounter_port, long cryptexd_port,
+                    const char *product_version, const char *ddi_dir);
+
 /* True if a personalized image is mounted (CopyDevices). */
 int cdhost_ddi_is_mounted(const char *tunnel_addr, long mounter_port);
 

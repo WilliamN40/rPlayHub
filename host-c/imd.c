@@ -28,6 +28,7 @@
 
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
+#include <libimobiledevice/property_list_service.h>
 #include <plist/plist.h>
 
 /* ------------------------------------------------------------------ JSON helpers (libplist values) */
@@ -340,9 +341,80 @@ int imd_pick_device(const api_device *devs, int n, const char *want)
  * bringup succeeds, released by imd_conn_close if the caller abandons the connection. */
 static idevice_t g_dev;
 
+/* Why the last bring-up failed, in words a user can act on ("" when the reason is not specific).
+ * cdhost.c shows it as list_devices' engine_error instead of its generic message. */
+static char g_bringup_reason[256];
+const char *imd_last_error(void) { return g_bringup_reason; }
+
+static const char *handshake_reason(lockdownd_error_t e)
+{
+    switch (e) {
+    case LOCKDOWN_E_PASSWORD_PROTECTED:
+        return "the iPhone is locked -- unlock it so it can pair with this computer";
+    case LOCKDOWN_E_PAIRING_DIALOG_RESPONSE_PENDING:
+        return "waiting for Trust This Computer -- tap Trust on the iPhone and enter the passcode";
+    case LOCKDOWN_E_USER_DENIED_PAIRING:
+        return "the iPhone declined to trust this computer -- unplug it, plug it back in and tap Trust";
+    case LOCKDOWN_E_INVALID_HOST_ID:
+        return "the iPhone no longer trusts this computer -- unplug it, plug it back in and tap Trust";
+    default:
+        return "";
+    }
+}
+
+/* Developer Mode, read from the AMFI lockdown domain. 1 on, 0 off, -1 unknown (an older iOS
+ * without the key, or a refused query -- treated as "do not block on it"). */
+static int developer_mode_status(lockdownd_client_t lk)
+{
+    plist_t v = NULL;
+    int st = -1;
+    if (lockdownd_get_value(lk, "com.apple.security.mac.amfi", "DeveloperModeStatus", &v) == LOCKDOWN_E_SUCCESS && v) {
+        if (plist_get_node_type(v) == PLIST_BOOLEAN) {
+            uint8_t b = 0;
+            plist_get_bool_val(v, &b);
+            st = b ? 1 : 0;
+        }
+        plist_free(v);
+    }
+    return st;
+}
+
+/* The Developer Mode switch in Settings stays hidden until a developer tool asks for it; on a Mac
+ * that is Xcode. com.apple.amfi.lockdown action 0 is that request: it only reveals the switch
+ * (Settings > Privacy & Security > Developer Mode) and changes nothing else -- turning it on, the
+ * restart and the confirmation stay with the user, on the phone. */
+static int reveal_developer_mode(idevice_t dev, lockdownd_client_t lk)
+{
+    lockdownd_service_descriptor_t svc = NULL;
+    if (lockdownd_start_service(lk, "com.apple.amfi.lockdown", &svc) != LOCKDOWN_E_SUCCESS || !svc)
+        return -1;
+    property_list_service_client_t plc = NULL;
+    int rc = -1;
+    if (property_list_service_client_new(dev, svc, &plc) == PROPERTY_LIST_SERVICE_E_SUCCESS && plc) {
+        if (svc->ssl_enabled) property_list_service_enable_ssl(plc);
+        plist_t req = plist_new_dict();
+        plist_dict_set_item(req, "action", plist_new_uint(0));
+        if (property_list_service_send_xml_plist(plc, req) == PROPERTY_LIST_SERVICE_E_SUCCESS) {
+            plist_t reply = NULL;
+            if (property_list_service_receive_plist_with_timeout(plc, &reply, 5000) == PROPERTY_LIST_SERVICE_E_SUCCESS && reply) {
+                plist_t ok = plist_dict_get_item(reply, "success");
+                uint8_t b = 0;
+                if (ok && plist_get_node_type(ok) == PLIST_BOOLEAN) plist_get_bool_val(ok, &b);
+                rc = b ? 0 : -1;
+                plist_free(reply);
+            }
+        }
+        plist_free(req);
+        property_list_service_client_free(plc);
+    }
+    lockdownd_service_descriptor_free(svc);
+    return rc;
+}
+
 static int bringup(const char *want, void **out_conn, char *udid_out, size_t udidlen,
                    char *devname, size_t dnlen, char *prodver, size_t pvlen)
 {
+    g_bringup_reason[0] = 0;
     printf("  enumerating devices for bring-up\n");
     api_device devs[API_MAX_DEVICES];
     int n = usbmux_enumerate(devs, API_MAX_DEVICES);
@@ -361,8 +433,12 @@ static int bringup(const char *want, void **out_conn, char *udid_out, size_t udi
 
     printf("\n== Layer 1-1.5: lockdown + TLS session (libimobiledevice) ==\n");
     lockdownd_client_t lk = NULL;
-    if (lockdownd_client_new_with_handshake(dev, &lk, "rplay-hub") != LOCKDOWN_E_SUCCESS || !lk) {
-        fprintf(stderr, "lockdown handshake failed (device paired & trusted?)\n");
+    lockdownd_error_t lerr = lockdownd_client_new_with_handshake(dev, &lk, "rplay-hub");
+    if (lerr != LOCKDOWN_E_SUCCESS || !lk) {
+        snprintf(g_bringup_reason, sizeof g_bringup_reason, "%s", handshake_reason(lerr));
+        fprintf(stderr, "lockdown handshake failed (error %d)%s%s\n", (int)lerr,
+                g_bringup_reason[0] ? ": " : " (device paired & trusted?)", g_bringup_reason);
+        if (lk) lockdownd_client_free(lk);
         idevice_free(dev); return -1;
     }
     const char *keys[] = { "DeviceName", "ProductType", "ProductVersion", "BuildVersion", "UniqueChipID" };
@@ -381,6 +457,19 @@ static int bringup(const char *want, void **out_conn, char *udid_out, size_t udi
     }
     if (atoi(prodver) > 0 && atoi(prodver) < 27)
         printf("\n  ⚠️  iOS %s cannot mirror (screen viewing needs iOS 27). Everything else works.\n", prodver);
+
+    int devmode = developer_mode_status(lk);
+    printf("  %-15s = %s\n", "DeveloperMode", devmode == 1 ? "on" : devmode == 0 ? "OFF" : "unknown");
+    if (devmode == 0) {
+        int revealed = reveal_developer_mode(dev, lk) == 0;
+        printf("  Developer Mode is off; %s\n", revealed
+               ? "asked the iPhone to show its switch (Settings > Privacy & Security > Developer Mode)"
+               : "could not ask the iPhone to show its switch");
+        snprintf(g_bringup_reason, sizeof g_bringup_reason,
+                 "Developer Mode is off -- on the iPhone open Settings > Privacy & Security > "
+                 "Developer Mode, turn it on, let it restart, then tap Turn On");
+        lockdownd_client_free(lk); idevice_free(dev); return -1;
+    }
 
     printf("\n== Layer 2: CoreDevice tunnel (CoreDeviceProxy) ==\n");
     lockdownd_service_descriptor_t svc = NULL;

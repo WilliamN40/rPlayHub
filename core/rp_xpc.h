@@ -38,6 +38,11 @@ extern "C" {
 #define RP_XPC_F_ALWAYS_SET     0x00000001u
 #define RP_XPC_F_DATA_PRESENT   0x00000100u
 #define RP_XPC_F_WANTING_REPLY  0x00010000u
+#define RP_XPC_F_REPLY          0x00020000u
+/* Out-of-band file transfers (cryptexd's install): the opening DATA frame of the stream that
+ * carries a payload has REQUEST set, and the device's acknowledgement on it has RESPONSE. */
+#define RP_XPC_F_FILE_TX_STREAM_REQUEST  0x00100000u
+#define RP_XPC_F_FILE_TX_STREAM_RESPONSE 0x00200000u
 #define RP_XPC_F_INIT_HANDSHAKE 0x00400000u
 
 /* object types */
@@ -51,8 +56,12 @@ typedef enum {
     RP_XPC_DATA   = 0x8000,
     RP_XPC_STRING = 0x9000,
     RP_XPC_UUID   = 0xA000,
+    RP_XPC_FD     = 0xB000,
     RP_XPC_ARRAY  = 0xE000,
-    RP_XPC_DICT   = 0xF000
+    RP_XPC_DICT   = 0xF000,
+    /* A file whose bytes travel on their own HTTP/2 stream: u64 transfer id, then a dictionary
+     * {"s": uint64 size}. See rp_rxpc_send_file. */
+    RP_XPC_FILE_TRANSFER = 0x1A000
 } rp_xpc_type;
 
 /* ------------------------------------------------------------------ writer */
@@ -87,6 +96,9 @@ void rp_xpc_double(rp_xpc_writer *w, double value);
 void rp_xpc_data(rp_xpc_writer *w, const void *bytes, size_t n);
 void rp_xpc_uuid(rp_xpc_writer *w, const uint8_t uuid[16]);
 void rp_xpc_null(rp_xpc_writer *w);
+/* An XPC file transfer: announces `size` bytes that follow out of band on their own stream,
+ * correlated by `transfer_id` (rp_rxpc_send_file). Wire: type | u64 id | dict {"s": uint64}. */
+void rp_xpc_file_transfer(rp_xpc_writer *w, uint64_t transfer_id, uint64_t size);
 
 /* Splice an already-encoded object in as one value.
  *

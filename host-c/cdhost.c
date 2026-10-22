@@ -587,6 +587,8 @@ static int rsd_enumerate(const char *addr, long port, api_session *out)
         "com.apple.coredevice.devicecontrol",
         "com.apple.coredevice.deviceinfo",
         "com.apple.coredevice.locationservice",
+        /* iOS 27 installs the DDI as a cryptex through this one (ddi.c). */
+        "com.apple.security.cryptexd.remote",
     };
     for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {
         rp_xpc_obj svc, portv;
@@ -617,7 +619,26 @@ static int rsd_enumerate(const char *addr, long port, api_session *out)
                 else if (i == 14) out->configuration_port = resolved;
                 else if (i == 15) out->devicecontrol_port = resolved;
                 else if (i == 16) out->deviceinfo_port = resolved;
-                else out->location_port = resolved;
+                else if (i == 17) out->location_port = resolved;
+                else {
+                    /* Capability tags in the handshake: a cryptexd whose Features list lacks
+                     * CryptexInstall cannot take the DDI. No list at all rules nothing out --
+                     * pymobiledevice3's require_feature reads it the same way. */
+                    rp_xpc_obj props, feats, f;
+                    int listed = 0, has = 0;
+                    if (rp_xpc_dict_get(&svc, "Properties", &props) == 0 &&
+                        rp_xpc_dict_get(&props, "Features", &feats) == 0 &&
+                        rp_xpc_array_count(&feats) > 0) {
+                        size_t cur = 0;
+                        listed = 1;
+                        while (rp_xpc_array_next(&feats, &cur, &f) == 0) {
+                            const char *fs = NULL;
+                            if (rp_xpc_get_string(&f, &fs) == 0 && !strcmp(fs, "CryptexInstall")) has = 1;
+                        }
+                    }
+                    if (listed && !has) printf("      (cryptexd does not advertise CryptexInstall)\n");
+                    out->cryptexd_port = (listed && !has) ? 0 : resolved;
+                }
             }
         } else {
             printf("    %-46s MISSING\n", want[i]);
@@ -1117,7 +1138,8 @@ static int wait_and_bind(int no_wait, conn_t *tun, char *udid, size_t udidlen,
         void *idev_conn = NULL;
         const char *failed = NULL;
         if (imd_bringup(target, &idev_conn, udid, udidlen, devname, dnlen, prodver, pvlen) != 0) {
-            failed = "bring-up failed (lockdown/CoreDeviceProxy) -- is the device unlocked and "
+            failed = imd_last_error()[0] ? imd_last_error()
+                   : "bring-up failed (lockdown/CoreDeviceProxy) -- is the device unlocked and "
                      "trusted, and on iOS 17 or later?";
         } else {
             tun->idev = idev_conn;
@@ -1420,14 +1442,31 @@ int main(int argc, char **argv) {
     session.ddi_dir = NULL;
 #endif
 
-    if (session.mounter_port && prodver[0] && atoi(prodver) >= 17) {
+    if ((session.mounter_port || session.cryptexd_port) && prodver[0] && atoi(prodver) >= 17) {
         printf("\n== Layer 3c: developer disk image ==\n");
-        int drc = cdhost_ddi_activate(addr, session.mounter_port, session.ddi_dir);
+        fflush(stdout);   /* ddi.c reports on stderr; keep the two in order in a shared log */
+        int drc = cdhost_ddi_auto(addr, session.mounter_port, session.cryptexd_port, prodver, session.ddi_dir);
+        fflush(stderr);
         if (drc == RP_DDI_ALREADY)      printf("  already mounted\n");
         else if (drc == RP_DDI_OK)      printf("  mounted (no Xcode/Device Hub needed)\n");
         else if (drc == RP_DDI_LOCKED)  printf("  the device is locked -- unlock it, then reconnect\n");
         else if (drc == RP_DDI_NO_DDI)  printf("  no DDI files: run scripts/fetch-ddi.sh (or set RPLAY_DDI), or mount via Xcode/Device Hub\n");
+        else if (drc == RP_DDI_TSS_FAILED) printf("  Apple's signing server refused the DDI ticket or could not be reached (reason above)\n");
         else                            printf("  could not mount the DDI (rc=%d); mirroring may not work\n", drc);
+
+        /* The services a DDI brings (displayservice, screencaptureservice, the HID service...) are
+         * not in the map we read before it was there: ask RSD again. They can take a moment to
+         * register, so retry briefly until displayservice shows up. */
+        if (drc == RP_DDI_OK || (drc == RP_DDI_ALREADY && !session.display_port)) {
+            for (int attempt = 1; attempt <= 6; attempt++) {
+                if (attempt > 1) sleep(2);
+                printf("\n== Layer 3b again: RSD after the DDI (attempt %d) ==\n", attempt);
+                if (rsd_enumerate(addr, rsd, &session) < 0) fprintf(stderr, "  service discovery failed\n");
+                if (session.display_port) break;
+            }
+            if (!session.display_port)
+                printf("  displayservice still missing after the DDI step; mirroring will not work\n");
+        }
     }
 
     /* Bound: every method is available from here, and viewers that connected while the engine
