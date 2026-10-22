@@ -63,6 +63,8 @@ extern "C" {
 #include <map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <set>
 #include <sstream>
 #ifdef _WIN32
@@ -207,6 +209,8 @@ static const DeviceModelSpec kDeviceModels[] = {
     {"iPhone17,3", "iPhone 16", 1179, 2556, 2},
     {"iPhone17,4", "iPhone 16 Plus", 1290, 2796, 2},
     {"iPhone17,5", "iPhone 16e", 1170, 2532, 1},
+    /* Measured from a live capture: coded 1328x2896, picture ends at column 1320 / row 2868. */
+    {"iPhone19,7", "iPhone", 1320, 2868, 2},
     /* iPhone SE / 8 (Home button, no cutout) */
     {"iPhone12,8", "iPhone SE (2nd gen)", 750, 1334, 0},
     {"iPhone14,6", "iPhone SE (3rd gen)", 750, 1334, 0},
@@ -533,6 +537,57 @@ static void api_async(const std::string &method, const json &params,
     }).detach();
 }
 
+/* Live touch: one persistent connection to the engine carrying "touch" samples (down / move / up)
+ * the moment the mouse produces them, so a drag on the mirror moves the phone's finger as the
+ * mouse moves. The old path sent a whole tap or swipe only on release, each over a fresh API
+ * connection that made the engine open a fresh HID channel -- a visible delay on every gesture.
+ * id 0 asks the engine for no reply, so nothing is read back. Queued moves coalesce to the newest
+ * one (a backlog of stale positions is worse than skipping them); down and up are never merged. */
+namespace touch_channel {
+static std::mutex              mu;
+static std::condition_variable cv;
+static std::deque<std::pair<int, std::string>> queue;   /* 0 down, 1 move, 2 up */
+static bool                    started = false;
+
+static void sender()
+{
+    int fd = -1;
+    for (;;) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [] { return !queue.empty(); });
+            line = queue.front().second;
+            queue.pop_front();
+        }
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (fd < 0) {
+                fd = tcp_connect(g_host, g_api_port);
+                if (fd < 0) break;
+                int one = 1;
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+            }
+            if (send(fd, line.data(), (int)line.size(), 0) == (ssize_t)line.size()) break;
+            close(fd);
+            fd = -1;
+        }
+    }
+}
+
+static void push(int kind, float fx, float fy)
+{
+    char buf[128];
+    static const char *phase[] = {"down", "move", "up"};
+    snprintf(buf, sizeof buf, "{\"id\":0,\"method\":\"touch\",\"params\":{\"phase\":\"%s\",\"fx\":%.5f,\"fy\":%.5f}}\n",
+             phase[kind], fx, fy);
+    std::lock_guard<std::mutex> lk(mu);
+    if (!started) { started = true; std::thread(sender).detach(); }
+    if (kind == 1 && !queue.empty() && queue.back().first == 1) queue.back().second = buf;
+    else queue.emplace_back(kind, buf);
+    cv.notify_one();
+}
+} // namespace touch_channel
+
 /* =========================================================================
  * 3b. Engine ownership
  * =========================================================================
@@ -679,7 +734,15 @@ static bool engine_spawn(bool first)
     /* The defaults start-rplay.bat used to set; anything the user set already wins. */
     win_env_default(L"RPLAY_USERSPACE_NET", L"1");
     win_env_default(L"RPLAY_KEYFRAME_EVERY_S", L"0");
-    win_env_default(L"RPLAY_FPS", L"60");
+    /* 30, not 60. Measured on an iPhone19,7 under the same fast scrolling: asking for 60 got 19 fps
+     * at 1.6 Mbps with 42% of frames at full resolution; asking for 30 got 31 fps at 3.8 Mbps with
+     * 55%. The encoder answers an unreachable frame rate by shedding resolution and bits. */
+    win_env_default(L"RPLAY_FPS", L"30");
+    /* No RCTL. Same phone, same fast scrolling, comparable motion (39-41 frames over 20 KB per
+     * 15 s): with the engine's rate-control messages the encoder sat at full resolution for 42-55%
+     * of frames; without them, 93-99%. Our RCTL is a reverse-engineered guess, and the encoder
+     * reads it as a reason to shed resolution. */
+    win_env_default(L"RPLAY_RCTL", L"0");
     win_env_default(L"RPLAY_MAX_BITRATE", L"15000000");
     if (!win_env_set(L"RPLAY_DDI")) {
         const std::wstring ddis[] = {
@@ -3674,23 +3737,26 @@ static void render_live_mirror(ImVec2 origin, ImVec2 size)
     ImGui::SetCursorScreenPos(ImVec2(px, py));
     ImGui::InvisibleButton("##MirrorSurface", ImVec2(target_w, target_h));
     const bool hovered = ImGui::IsItemHovered();
+    /* Live touch: press = finger down, every mouse move while held = finger moves, release =
+     * finger up -- streamed as they happen (touch_channel), so a tap is just a short press and a
+     * drag scrolls in step with the mouse. */
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         g_focused_pane = FocusPane::Stage;
         g_drag_active = true;
         map_mirror_touch(ImGui::GetIO().MousePos, ImVec2(px, py), ImVec2(target_w, target_h), g_drag_fx0, g_drag_fy0);
         g_drag_t0_ms = now_ms();
+        touch_channel::push(0, g_drag_fx0, g_drag_fy0);
     }
-    if (g_drag_active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-        g_drag_active = false;
-        float fx1 = 0.0f, fy1 = 0.0f;
+    if (g_drag_active) {
+        float fx1 = g_drag_fx0, fy1 = g_drag_fy0;
         map_mirror_touch(ImGui::GetIO().MousePos, ImVec2(px, py), ImVec2(target_w, target_h), fx1, fy1);
-        float dist_px = std::hypot((fx1 - g_drag_fx0) * target_w, (fy1 - g_drag_fy0) * target_h);
-        int dur_ms = (int)std::clamp<uint64_t>(now_ms() - g_drag_t0_ms, 80, 1000);
-        if (dist_px < 8.0f * s) {
-            api_async("tap", {{"fx", g_drag_fx0}, {"fy", g_drag_fy0}});
-        } else {
-            api_async("swipe", {{"fx0", g_drag_fx0}, {"fy0", g_drag_fy0},
-                                {"fx1", fx1}, {"fy1", fy1}, {"duration_ms", dur_ms}});
+        fx1 = std::clamp(fx1, 0.0f, 1.0f);
+        fy1 = std::clamp(fy1, 0.0f, 1.0f);
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            g_drag_active = false;
+            touch_channel::push(2, fx1, fy1);
+        } else if (ImGui::GetIO().MouseDelta.x != 0.0f || ImGui::GetIO().MouseDelta.y != 0.0f) {
+            touch_channel::push(1, fx1, fy1);
         }
     }
     if (hovered) {

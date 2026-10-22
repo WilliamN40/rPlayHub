@@ -15,7 +15,8 @@ cd /d "%~dp0"
 :: The engine uses its userspace TCP/IP stack (lwIP) by default on Windows; setting it is harmless.
 if not defined RPLAY_USERSPACE_NET set RPLAY_USERSPACE_NET=1
 if not defined RPLAY_KEYFRAME_EVERY_S set RPLAY_KEYFRAME_EVERY_S=0
-if not defined RPLAY_FPS set RPLAY_FPS=60
+if not defined RPLAY_FPS set RPLAY_FPS=30
+if not defined RPLAY_RCTL set RPLAY_RCTL=0
 if not defined RPLAY_MAX_BITRATE set RPLAY_MAX_BITRATE=15000000
 :: The Developer Disk Image: scripts\fetch-ddi.ps1 puts it in %LOCALAPPDATA%\rplayhub\iOS_DDI,
 :: where the engine looks by itself; an older checkout-local copy in deps\iOS_DDI still works.

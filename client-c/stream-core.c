@@ -167,21 +167,29 @@ void annexb_finish(annexb_parser *p, nal_fn on_nal, void *ctx)
  * by chance, and a false positive would truncate real slice data. */
 static int parse_active_rect_trailer(const uint8_t *nal, size_t n, int *w, int *h, size_t *cut)
 {
-    static const int tiers[][2] = { {1184, 2576}, {1088, 1920}, {720, 1280} };
+    /* Unescaped: [w:u16be][h:u16be] 00 00 00 00 [5-byte tag]. On the wire emulation prevention
+     * puts 03s into it, and where depends on the size (h = 0x0500 ends in a zero byte, so
+     * 720x1280 escapes differently from 1328x2896), so the tail is unescaped before matching.
+     * Sizes differ per model (1184x2576 on an iPhone 13 Pro, 1328x2896 on an iPhone19,7), so any
+     * 16-aligned size is accepted. Same rule as the decoder's (patches/ffmpeg-rvra.patch). */
     if (n <= 24) return 0;
-    for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
-        const uint8_t pat[4] = { (uint8_t)(tiers[t][0] >> 8), (uint8_t)tiers[t][0],
-                                 (uint8_t)(tiers[t][1] >> 8), (uint8_t)tiers[t][1] };
-        long lo = (long)n - 24;
-        if (lo < 1) lo = 1;
-        for (long i = (long)n - 5; i >= lo; i--) {
-            if (nal[i] == pat[0] && nal[i + 1] == pat[1] &&
-                nal[i + 2] == pat[2] && nal[i + 3] == pat[3] && nal[i + 4] == 0) {
-                *w = tiers[t][0];
-                *h = tiers[t][1];
-                *cut = (size_t)i;
-                return 1;
-            }
+    uint8_t raw[48];
+    size_t map[48];
+    int m = 0, zeros = 0;
+    for (size_t i = n > 48 ? n - 48 : 0; i < n; i++) {
+        if (zeros >= 2 && nal[i] == 3) { zeros = 0; continue; }
+        zeros = nal[i] ? 0 : zeros + 1;
+        raw[m] = nal[i];
+        map[m++] = i;
+    }
+    for (int i = m - 12; i >= 0 && i >= m - 32; i--) {
+        int tw = (raw[i] << 8) | raw[i + 1], th = (raw[i + 2] << 8) | raw[i + 3];
+        if (!(tw & 15) && !(th & 15) && tw >= 128 && th >= 128 && tw <= 4096 && th <= 8192 &&
+            !raw[i + 4] && !raw[i + 5] && !raw[i + 6] && !raw[i + 7]) {
+            *w = tw;
+            *h = th;
+            *cut = map[i];
+            return 1;
         }
     }
     return 0;

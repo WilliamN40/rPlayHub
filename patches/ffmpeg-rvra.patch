@@ -223,32 +223,36 @@
      }
  
      if (IS_IRAP(s))
-@@ -3859,6 +4035,32 @@
+@@ -3859,6 +4035,36 @@
  
      s->pkt_dts = avpkt->dts;
  
 +    /* RVRA: the active size rides as a trailer on the last slice NAL of the access unit --
 +     * past rbsp_slice_trailing_bits, invisible to the parser -- so it is read straight off
-+     * the packet tail. The tier list plus a zero byte over a 32-byte window is what keeps
-+     * entropy-coded data from matching by accident (same match rule the capture tooling
-+     * uses); an unmatched packet keeps the previous size, which is what one slice per
-+     * picture and a trailer on every slice make correct. */
++     * the packet tail. Unescaped it is [w:u16be][h:u16be] 00 00 00 00 [5-byte tag]; on the
++     * wire emulation prevention puts 03s into it, and WHERE depends on the size (h = 0x0500
++     * ends in a zero byte, so 720x1280 escapes differently from 1328x2896), which is why the
++     * tail is unescaped before matching rather than matched as bytes. Sizes differ per model
++     * (1184x2576 on an iPhone 13 Pro, 1328x2896 on an iPhone19,7), so any 16-aligned size is
++     * accepted; the four zero bytes and the tag after them, within the last 32 bytes, are what
++     * keep slice data from matching. An unmatched packet keeps the previous size, which is
++     * what one slice per picture and a trailer on every slice make correct. */
 +    if (s->rvra_enable && avpkt->size > 30) {
-+        static const uint16_t tiers[][2] = { {1184, 2576}, {1088, 1920}, {720, 1280} };
 +        const uint8_t *p = avpkt->data;
-+        int n = avpkt->size;
-+        int lo = n > 32 ? n - 32 : 1;
-+        int found = 0;
-+        for (int i = n - 5; i >= lo && !found; i--) {
-+            for (int t = 0; t < FF_ARRAY_ELEMS(tiers); t++) {
-+                if (p[i]     == (tiers[t][0] >> 8) && p[i + 1] == (tiers[t][0] & 0xff) &&
-+                    p[i + 2] == (tiers[t][1] >> 8) && p[i + 3] == (tiers[t][1] & 0xff) &&
-+                    p[i + 4] == 0) {
-+                    s->rvra_pending_w = tiers[t][0];
-+                    s->rvra_pending_h = tiers[t][1];
-+                    found = 1;
-+                    break;
-+                }
++        int n = avpkt->size, m = 0, zeros = 0;
++        uint8_t raw[48];
++        for (int i = n > 48 ? n - 48 : 0; i < n; i++) {
++            if (zeros >= 2 && p[i] == 3) { zeros = 0; continue; }
++            zeros = p[i] ? 0 : zeros + 1;
++            raw[m++] = p[i];
++        }
++        for (int i = m - 12; i >= 0 && i >= m - 32; i--) {
++            int w = (raw[i] << 8) | raw[i + 1], h = (raw[i + 2] << 8) | raw[i + 3];
++            if (!(w & 15) && !(h & 15) && w >= 128 && h >= 128 && w <= 4096 && h <= 8192 &&
++                !raw[i + 4] && !raw[i + 5] && !raw[i + 6] && !raw[i + 7]) {
++                s->rvra_pending_w = w;
++                s->rvra_pending_h = h;
++                break;
 +            }
 +        }
 +    }
@@ -256,7 +260,7 @@
      sd = av_packet_get_side_data(avpkt, AV_PKT_DATA_NEW_EXTRADATA, &sd_size);
      if (sd && sd_size > 0) {
          ret = hevc_decode_extradata(s, sd, sd_size, 0);
-@@ -3917,6 +4119,9 @@
+@@ -3917,6 +4123,9 @@
      dst->flags      = src->flags;
  
      dst->base_layer_frame = src->base_layer_frame;
@@ -266,7 +270,7 @@
  
      av_refstruct_replace(&dst->hwaccel_picture_private,
                            src->hwaccel_picture_private);
-@@ -4167,6 +4372,51 @@
+@@ -4167,6 +4376,51 @@
      s->sei.picture_timing.picture_struct = 0;
      s->eos = 1;
  

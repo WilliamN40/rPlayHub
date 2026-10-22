@@ -515,6 +515,56 @@ static int hid_send(rp_rxpc_session *s, const uint8_t report[58])
     return rp_rxpc_send(s, body, w.len, 0);
 }
 
+/* One HID channel for the session, opened on first use and kept. Opening one is a TCP connect
+ * through the tunnel plus the HTTP/2 + RemoteXPC handshake, and paying that on every tap and
+ * swipe was most of what made control feel laggy. Callers hold g_hid_mu for a whole gesture so
+ * two clients cannot interleave samples.
+ *
+ * Touch is fire-and-forget and nothing reads this channel, so the device's WINDOW_UPDATEs are
+ * never seen and the outbound HTTP/2 window only shrinks. The channel is therefore replaced
+ * before it runs dry -- between gestures when under HID_WINDOW_LOW, mid-gesture only at
+ * HID_WINDOW_MIN -- and dropped and reopened once on any send failure. */
+#define HID_WINDOW_LOW  16384
+#define HID_WINDOW_MIN  2048
+static pthread_mutex_t g_hid_mu = PTHREAD_MUTEX_INITIALIZER;
+static svc_conn g_hid;
+static int g_hid_open;
+
+static int64_t hid_window_left(void)
+{
+    int64_t left = g_hid.s.out_conn_window;
+    for (int i = 0; i < g_hid.s.out_stream_count; i++)
+        if (g_hid.s.out_streams[i].stream == RP_RXPC_ROOT_STREAM && g_hid.s.out_streams[i].window < left)
+            left = g_hid.s.out_streams[i].window;
+    return left;
+}
+
+static void hid_drop_locked(void)
+{
+    if (g_hid_open) svc_close(&g_hid);
+    g_hid_open = 0;
+}
+
+/* Open the channel if needed; with at_gesture_start, also replace one that is running low. */
+static int hid_ready_locked(const api_session *sess, int at_gesture_start)
+{
+    if (g_hid_open && hid_window_left() < (at_gesture_start ? HID_WINDOW_LOW : HID_WINDOW_MIN))
+        hid_drop_locked();
+    if (g_hid_open) return 0;
+    if (svc_open(&g_hid, sess->tunnel_addr, sess->hid_port) != 0) return -1;
+    g_hid_open = 1;
+    return 0;
+}
+
+static int hid_emit_locked(const api_session *sess, const uint8_t report[58])
+{
+    if (hid_ready_locked(sess, 0) != 0) return -1;
+    if (hid_send(&g_hid.s, report) == 0) return 0;
+    hid_drop_locked();
+    if (hid_ready_locked(sess, 0) != 0) return -1;
+    return hid_send(&g_hid.s, report);
+}
+
 /* Hardware-style buttons, expressed as the gestures that actually perform them.
  *
  * The device advertises a "mainScreenButtons" HID surface (_ServiceID 1026) alongside the
@@ -552,8 +602,9 @@ static void method_button(int fd, long id, const char *line)
         return;
     }
 
-    svc_conn c;
-    if (svc_open(&c, sess->tunnel_addr, sess->hid_port) != 0) {
+    pthread_mutex_lock(&g_hid_mu);
+    if (hid_ready_locked(sess, 1) != 0) {
+        pthread_mutex_unlock(&g_hid_mu);
         reply_error(fd, id, "unavailable", "cannot reach universalhidservice");
         return;
     }
@@ -566,12 +617,12 @@ static void method_button(int fd, long id, const char *line)
         uint16_t px = (uint16_t)(x * 65535.0);
         uint16_t py = (uint16_t)((from_y + (to_y - from_y) * t) * 65535.0);
         touch_report(report, TS_STATE_CONTACT, px, py);
-        if (hid_send(&c.s, report) != 0) break;
+        if (hid_emit_locked(sess, report) != 0) break;
         sleep_ns((int64_t)duration * 1000000LL / (steps + 1));
     }
     touch_report(report, TS_STATE_RELEASE, (uint16_t)(x * 65535.0), (uint16_t)(to_y * 65535.0));
-    hid_send(&c.s, report);
-    svc_close(&c);
+    hid_emit_locked(sess, report);
+    pthread_mutex_unlock(&g_hid_mu);
 
     send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{}}", id);
 }
@@ -600,8 +651,9 @@ static void method_touch(int fd, long id, const char *line, int is_swipe)
     if (duration < 0) duration = 0;
     if (duration > 600000) duration = 600000;    /* ten minutes is not a gesture */
 
-    svc_conn c;
-    if (svc_open(&c, sess->tunnel_addr, sess->hid_port) != 0) {
+    pthread_mutex_lock(&g_hid_mu);
+    if (hid_ready_locked(sess, 1) != 0) {
+        pthread_mutex_unlock(&g_hid_mu);
         reply_error(fd, id, "unavailable", "cannot reach universalhidservice");
         return;
     }
@@ -614,15 +666,49 @@ static void method_touch(int fd, long id, const char *line, int is_swipe)
         uint16_t x = (uint16_t)((fx + (fx1 - fx) * t) * 65535.0);
         uint16_t y = (uint16_t)((fy + (fy1 - fy) * t) * 65535.0);
         touch_report(report, TS_STATE_CONTACT, x, y);
-        if (hid_send(&c.s, report) != 0) break;
+        if (hid_emit_locked(sess, report) != 0) break;
         sleep_ns((int64_t)duration * 1000000LL / (steps + 1));
     }
     touch_report(report, TS_STATE_RELEASE,
                  (uint16_t)(fx1 * 65535.0), (uint16_t)(fy1 * 65535.0));
-    hid_send(&c.s, report);
-    svc_close(&c);
+    hid_emit_locked(sess, report);
+    pthread_mutex_unlock(&g_hid_mu);
 
     send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{}}", id);
+}
+
+/* Live touch: one sample per call, sent the moment it arrives, so a drag on the mirror moves the
+ * phone's finger as the mouse moves instead of being replayed after release. phase is "down",
+ * "move" or "up"; fx/fy are screen fractions. A client streams these over one API connection and
+ * may ignore the replies ("id" 0 asks for none). */
+static void method_touch_live(int fd, long id, const char *line)
+{
+    const api_session *sess = g_session;
+    if (!sess->hid_port) {
+        if (id) reply_error(fd, id, "unavailable", "the device did not offer universalhidservice");
+        return;
+    }
+    char phase[8] = {0};
+    if (json_string_field(line, "phase", phase, sizeof phase) != 0) phase[0] = 0;
+    int down = !strcmp(phase, "down"), up = !strcmp(phase, "up");
+    if (!down && !up && strcmp(phase, "move")) {
+        if (id) reply_error(fd, id, "bad_request", "phase must be down, move or up");
+        return;
+    }
+    double fx = json_fraction(line, "fx", -1), fy = json_fraction(line, "fy", -1);
+    fx = fx < 0 ? 0 : fx > 1 ? 1 : fx;
+    fy = fy < 0 ? 0 : fy > 1 ? 1 : fy;
+
+    uint8_t report[58];
+    touch_report(report, up ? TS_STATE_RELEASE : TS_STATE_CONTACT,
+                 (uint16_t)(fx * 65535.0), (uint16_t)(fy * 65535.0));
+    pthread_mutex_lock(&g_hid_mu);
+    int rc = hid_ready_locked(sess, down);
+    if (rc == 0) rc = hid_emit_locked(sess, report);
+    pthread_mutex_unlock(&g_hid_mu);
+    if (!id) return;
+    if (rc != 0) reply_error(fd, id, "unavailable", "cannot reach universalhidservice");
+    else send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{}}", id);
 }
 
 /* ------------------------------------------------------------------ classic shim services
@@ -2098,8 +2184,11 @@ static void method_device_info(int fd, long id, const char *line)
 static void method_activate(int fd, long id)
 {
     const api_session *s = g_session;
-    if (!s->mounter_port) { reply_error(fd, id, "unavailable", "the device did not offer mobile_image_mounter"); return; }
-    int rc = cdhost_ddi_activate(s->tunnel_addr, s->mounter_port, s->ddi_dir);
+    if (!s->mounter_port && !s->cryptexd_port) {
+        reply_error(fd, id, "unavailable", "the device offered neither mobile_image_mounter nor cryptexd");
+        return;
+    }
+    int rc = cdhost_ddi_auto(s->tunnel_addr, s->mounter_port, s->cryptexd_port, s->product_version, s->ddi_dir);
     if (rc == RP_DDI_OK || rc == RP_DDI_ALREADY)
         send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{\"mounted\":true,\"already\":%s}}", id, rc == RP_DDI_ALREADY ? "true" : "false");
     else if (rc == RP_DDI_LOCKED)  reply_error(fd, id, "locked", "unlock the device and try again");
@@ -2988,6 +3077,7 @@ static void dispatch(int fd, const char *line)
     if (!strcmp(method, "take_screenshot")) { if (need_session(fd, id)) method_screenshot(fd, id); return; }
     if (!strcmp(method, "tap")) { if (need_session(fd, id)) method_touch(fd, id, line, 0); return; }
     if (!strcmp(method, "swipe")) { if (need_session(fd, id)) method_touch(fd, id, line, 1); return; }
+    if (!strcmp(method, "touch")) { if (need_session(fd, id)) method_touch_live(fd, id, line); return; }
 
     /* Named explicitly rather than lumped into one message, so the log says which capability is
      * missing rather than that something is. */
