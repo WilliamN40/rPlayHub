@@ -165,7 +165,7 @@ static void *recv_loop(void *arg)
         {
             struct sockaddr_in6 from;
             socklen_t flen = sizeof from;
-            n = recvfrom(m->udp, pkt, sizeof pkt, 0, (struct sockaddr *)&from, &flen);
+            n = recvfrom(m->udp, (char *)pkt, sizeof pkt, 0, (struct sockaddr *)&from, &flen);
             if (n > 0 && !m->have_peer) { m->peer = from; m->have_peer = 1; }
         }
         if (n <= 0) {
@@ -209,7 +209,7 @@ static void *recv_loop(void *arg)
          * that, but do not treat a mirrored run as a clean baseline -- compare mirrored against
          * mirrored, and take loss figures from a run with the mirror off. */
         if (m->fwd_fd >= 0)
-            sendto(m->fwd_fd, pkt, (size_t)n, 0,
+            sendto(m->fwd_fd, (const char *)pkt, (size_t)n, 0,
                    (struct sockaddr *)&m->fwd_addr, sizeof m->fwd_addr);
 
 #define DBG_WORK_DONE() do { if (dbg) { struct timespec ts_; clock_gettime(CLOCK_MONOTONIC, &ts_); \
@@ -485,7 +485,7 @@ static int kernel_udp_socket(int *recv_port)
     struct sockaddr_in6 bind_addr;
     memset(&bind_addr, 0, sizeof bind_addr);
     bind_addr.sin6_family = AF_INET6;
-    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) != 0) { close(fd); return -1; }
+    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) != 0) { sock_close(fd); return -1; }
     socklen_t blen = sizeof bind_addr;
     getsockname(fd, (struct sockaddr *)&bind_addr, &blen);
     *recv_port = ntohs(bind_addr.sin6_port);
@@ -872,7 +872,7 @@ void media_request_keyframe(media_session *m)
 
 void media_stop(media_session *m)
 {
-    if (m && m->fwd_fd >= 0) { close(m->fwd_fd); m->fwd_fd = -1; }
+    if (m && m->fwd_fd >= 0) { sock_close(m->fwd_fd); m->fwd_fd = -1; }
     if (m) { free(m->ra_queue); m->ra_queue = NULL; free(m->ra_nal); m->ra_nal = NULL; }
     if (!m) return;
 
@@ -911,8 +911,8 @@ void media_stop(media_session *m)
     if (m->udp >= 0) tun_close(m->udp);
     if (m->svc >= 0) tun_close(m->svc);
 #else
-    if (m->udp >= 0) close(m->udp);
-    if (m->svc >= 0) close(m->svc);
+    if (m->udp >= 0) sock_close(m->udp);
+    if (m->svc >= 0) sock_close(m->svc);
 #endif
     free(m->rtp_storage);
     free(m->rxpc_reassembly);
@@ -925,9 +925,15 @@ void media_stats(const media_session *m, uint64_t *packets, uint64_t *nals, uint
                  uint64_t *late, uint64_t *dup)
 {
     if (!m) {
-        if (packets) *packets = 0; if (nals) *nals = 0; if (keyframes) *keyframes = 0;
-        if (lost) *lost = 0; if (ltr_acked) *ltr_acked = 0; if (mbps) *mbps = 0;
-        if (bad) *bad = 0; if (late) *late = 0; if (dup) *dup = 0;
+        if (packets) *packets = 0;
+        if (nals) *nals = 0;
+        if (keyframes) *keyframes = 0;
+        if (lost) *lost = 0;
+        if (ltr_acked) *ltr_acked = 0;
+        if (mbps) *mbps = 0;
+        if (bad) *bad = 0;
+        if (late) *late = 0;
+        if (dup) *dup = 0;
         return;
     }
     if (packets) *packets = m->packets;

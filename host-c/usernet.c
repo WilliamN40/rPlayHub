@@ -16,6 +16,7 @@
 #include "lwip/stats.h"
 #include <stdlib.h>
 #include <time.h>
+#include <errno.h>
 
 static void *g_conn;             /* the idevice_connection_t */
 static struct netif g_netif;
@@ -133,8 +134,11 @@ static void *reader_thread(void *arg)
             uint8_t skip[2048];
             size_t left = plen;
             drop_nopbuf++;
-            while (left) { size_t c = left < sizeof skip ? left : sizeof skip;
-                           if (imd_conn_recv(g_conn, skip, c) != 0) return NULL; left -= c; }
+            while (left) {
+                size_t c = left < sizeof skip ? left : sizeof skip;
+                if (imd_conn_recv(g_conn, skip, c) != 0) goto dead;
+                left -= c;
+            }
             continue;
         }
         memcpy(p->payload, hdr, 40);
@@ -169,6 +173,12 @@ static void *reader_thread(void *arg)
             pbuf_free(p);
         }
     }
+dead:
+    /* The CoreDeviceProxy connection is gone (unplugged, rebooted, dropped off wifi). Every lwIP
+     * socket above it is now dead too, but nothing would say so: reads just block. Hand over to
+     * the engine, which restarts into the waiting state -- bug #7 is a session that outlives its
+     * tunnel. */
+    cdhost_tunnel_died("the CoreDeviceProxy connection ended (device unplugged, asleep or rebooted?)");
     return NULL;
 }
 
@@ -201,26 +211,78 @@ int usernet_start(void *idev_conn, const char *our_addr, const char *dev_addr)
     return 0;
 }
 
+/* ------------------------------------------------------------------ fd ownership (see usernet.h)
+ *
+ * One flag per lwIP socket slot. Set right after lwip_socket hands a fd out and cleared right
+ * BEFORE lwip_close returns the slot -- in that order, so the slot can never be reused (by another
+ * thread's lwip_socket) while its flag still says something about the old socket. */
+#if LWIP_SOCKET_OFFSET != USERNET_FD_BASE
+#error "USERNET_FD_BASE (usernet.h) must equal LWIP_SOCKET_OFFSET (lwip-engine/lwipopts.h)"
+#endif
+#define OWNED_SLOTS 256
+static volatile unsigned char g_owned[OWNED_SLOTS];
+
+static void owned_set(int fd, unsigned char v)
+{
+    int i = fd - LWIP_SOCKET_OFFSET;
+    if (i >= 0 && i < OWNED_SLOTS) __atomic_store_n(&g_owned[i], v, __ATOMIC_SEQ_CST);
+}
+
+int usernet_owns(int fd)
+{
+    int i = fd - LWIP_SOCKET_OFFSET;
+    return i >= 0 && i < OWNED_SLOTS && __atomic_load_n(&g_owned[i], __ATOMIC_SEQ_CST);
+}
+
+static int owned_socket(int type)
+{
+    int s = lwip_socket(AF_INET6, type, 0);
+    if (s >= 0) owned_set(s, 1);
+    return s;
+}
+
+void usernet_close(int fd)
+{
+    if (fd < 0) return;
+    owned_set(fd, 0);
+    lwip_close(fd);
+}
+
 int usernet_connect(const char *addr, int port)
 {
-    int s = lwip_socket(AF_INET6, SOCK_STREAM, 0);
+    int s = owned_socket(SOCK_STREAM);
     if (s < 0) return -1;
     struct sockaddr_in6 sa;
     memset(&sa, 0, sizeof sa);
     sa.sin6_family = AF_INET6;
     sa.sin6_port = lwip_htons((u16_t)port);
-    if (lwip_inet_pton(AF_INET6, addr, &sa.sin6_addr) != 1) { lwip_close(s); return -1; }
-    if (lwip_connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) { lwip_close(s); return -1; }
+    if (lwip_inet_pton(AF_INET6, addr, &sa.sin6_addr) != 1) { usernet_close(s); return -1; }
+    if (lwip_connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) { usernet_close(s); return -1; }
     return s;
 }
 
 long usernet_read(int fd, void *buf, size_t n)  { return lwip_recv(fd, buf, n, 0); }
 long usernet_write(int fd, const void *buf, size_t n) { return lwip_send(fd, buf, n, 0); }
-void usernet_close(int fd) { lwip_close(fd); }
+
+/* SO_RCVTIMEO for one read, then back to blocking, so a later plain read on the same fd is not
+ * surprised by a deadline it never asked for. lwIP reports its receive timeout as EWOULDBLOCK
+ * (err.c maps ERR_TIMEOUT there). */
+long usernet_read_timeout(int fd, void *buf, size_t n, int ms)
+{
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 }, none = { 0, 0 };
+    if (ms > 0) lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    errno = 0;
+    long r = lwip_recv(fd, buf, n, ms > 0 ? 0 : MSG_DONTWAIT);
+    int e = errno;
+    if (ms > 0) lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none);
+    if (r < 0 && (e == EWOULDBLOCK || e == EAGAIN)) return TUN_TIMEOUT;
+    errno = e;
+    return r;
+}
 
 int usernet_udp_socket(int *bound_port)
 {
-    int s = lwip_socket(AF_INET6, SOCK_DGRAM, 0);
+    int s = owned_socket(SOCK_DGRAM);
     if (s < 0) return -1;
     struct sockaddr_in6 sa;
     memset(&sa, 0, sizeof sa);
@@ -228,7 +290,7 @@ int usernet_udp_socket(int *bound_port)
     socklen_t slen = sizeof sa;
     if (lwip_bind(s, (struct sockaddr *)&sa, sizeof sa) != 0 ||
         lwip_getsockname(s, (struct sockaddr *)&sa, &slen) != 0) {
-        lwip_close(s);
+        usernet_close(s);
         return -1;
     }
     if (bound_port) *bound_port = lwip_ntohs(sa.sin6_port);

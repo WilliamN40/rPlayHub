@@ -87,15 +87,19 @@ size_t rp_h2_write_connection_start(uint32_t window, uint8_t *out, size_t cap)
     size_t off = 0, n;
     /* The order matters: the preface must come first, and the streams must be opened before any
      * DATA is sent on them. */
-    if (!(n = rp_h2_write_preface(out + off, cap - off))) return 0; off += n;
-    if (!(n = rp_h2_write_settings(100, window, out + off, cap - off))) return 0; off += n;
+    if (!(n = rp_h2_write_preface(out + off, cap - off))) return 0;
+    off += n;
+    if (!(n = rp_h2_write_settings(100, window, out + off, cap - off))) return 0;
+    off += n;
     if (window > 65535) {
         /* The connection window starts at 65535; raise it by the difference. */
         if (!(n = rp_h2_write_window_update(0, window - 65535, out + off, cap - off))) return 0;
         off += n;
     }
-    if (!(n = rp_h2_write_headers(RP_H2_STREAM_ROOT, out + off, cap - off))) return 0; off += n;
-    if (!(n = rp_h2_write_headers(RP_H2_STREAM_REPLY, out + off, cap - off))) return 0; off += n;
+    if (!(n = rp_h2_write_headers(RP_H2_STREAM_ROOT, out + off, cap - off))) return 0;
+    off += n;
+    if (!(n = rp_h2_write_headers(RP_H2_STREAM_REPLY, out + off, cap - off))) return 0;
+    off += n;
     return off;
 }
 

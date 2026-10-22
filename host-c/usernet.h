@@ -16,7 +16,7 @@
 int usernet_start(void *idev_conn, const char *our_addr, const char *dev_addr);
 
 /* Open a TCP connection to [addr]:port over the userspace stack. Returns an lwIP socket fd
- * (>= USERNET_FD_BASE) or -1. Use usernet_read/write/close on it (NOT kernel recv/send). */
+ * (numbered from USERNET_FD_BASE) or -1. Use usernet_read/write/close on it (NOT kernel recv/send). */
 int usernet_connect(const char *addr, int port);
 long usernet_read(int fd, void *buf, size_t n);
 long usernet_write(int fd, const void *buf, size_t n);
@@ -51,16 +51,31 @@ int  tun_connect(const char *addr, int port, int timeout_s);
 long tun_read(int fd, void *buf, size_t n);
 long tun_write(int fd, const void *buf, size_t n);
 void tun_close(int fd);
+/* Read with a deadline: >0 bytes, 0 = orderly EOF, -1 = error, TUN_TIMEOUT = nothing arrived
+ * within `ms`. lwIP's select() is compiled out (lwipopts.h), so a loop that must also watch
+ * something else -- the syslog relay noticing its API client hang up -- polls with this. */
+#define TUN_TIMEOUT (-2)
+long tun_read_timeout(int fd, void *buf, size_t n, int ms);
+long usernet_read_timeout(int fd, void *buf, size_t n, int ms);
+
+/* Whether `fd` is a LIVE lwIP socket. Ownership is tracked explicitly by usernet.c (set when
+ * lwip_socket hands the fd out, cleared before lwip_close gives it back) rather than inferred
+ * from the number: lwIP numbers its fds from LWIP_SOCKET_OFFSET (768), and a Winsock SOCKET is a
+ * kernel handle value that can be 768 or anything else, so "fd >= 768" misrouted real sockets.
+ * Kernel sockets never reach the tun_* calls while userspace mode is on (every tunnel connection
+ * is lwIP then), so a Winsock handle that happens to equal a live lwIP fd cannot be confused. */
+int  usernet_owns(int fd);
 #else
 #include <sys/socket.h>
 #include <unistd.h>
 static inline long tun_read(int fd, void *buf, size_t n)        { return (long)recv(fd, buf, n, 0); }
 static inline long tun_write(int fd, const void *buf, size_t n) { return (long)send(fd, buf, n, 0); }
 static inline void tun_close(int fd)                            { close(fd); }
+/* No lwIP compiled in: nothing is ever an lwIP socket. */
+static inline int  usernet_owns(int fd)                         { (void)fd; return 0; }
 #endif
 
-/* lwIP fds are offset above kernel fds; a fd >= this is a usernet (lwIP) socket. */
+/* lwIP fds are numbered from LWIP_SOCKET_OFFSET (lwip-engine/lwipopts.h); kept in step there. */
 #define USERNET_FD_BASE 768
-static inline int usernet_owns(int fd) { return fd >= USERNET_FD_BASE; }
 
 #endif

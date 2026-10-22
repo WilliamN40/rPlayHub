@@ -37,23 +37,42 @@ typedef struct {
 
 #define API_MAX_DEVICES 16
 
-/* Fills `out` with the attached devices, returning how many. Implemented in cdhost.c because
- * that is where the usbmux client lives; declared here because the API server is what needs it. */
+/* Fills `out` with the attached devices, returning how many -- or -1 when usbmuxd itself cannot
+ * be reached (no daemon; on Windows, Apple Mobile Device Service not installed or not running),
+ * which is a different answer from "reachable, zero devices". Implemented in imd.c. */
 int usbmux_enumerate(api_device *out, int max);
+
+/* What the GUI should tell the user when usbmuxd is unreachable (list_devices' usbmuxd_error). */
+#ifdef _WIN32
+#define USBMUXD_MISSING_MESSAGE "Apple Mobile Device Service is not running. Install Apple Devices (Microsoft Store) or iTunes."
+#elif defined(__APPLE__)
+#define USBMUXD_MISSING_MESSAGE "usbmuxd is not reachable (/var/run/usbmuxd). It is part of macOS; a reboot normally restores it."
+#else
+#define USBMUXD_MISSING_MESSAGE "usbmuxd is not running. Install it (e.g. apt install usbmuxd) and plug the iPhone in, or start it with 'sudo systemctl start usbmuxd'."
+#endif
 
 /* The Info tab's data for `udid`: lockdown GetValue over a session, rendered as JSON in the shape
  * host/deviceinfo.py produced ({"default":{..},"com.apple.mobile.battery":{..},...,
  * "unavailable":{..},"session_error":..}). Returns non-zero with {"error":..} in `json`. */
 int cdhost_device_info(const char *udid, char *json, size_t cap);
 
+/* Which of `devs` a bring-up would bind: the first whose udid starts with `want` when that is
+ * non-empty, else the USB entry over a wifi one. -1 when none qualifies. */
+int imd_pick_device(const api_device *devs, int n, const char *want);
+
 /* Stage-3 tunnel bringup via libimobiledevice (host-c/imd.c). Does Layers 0-2 and returns a
  * connected, TLS'd CoreDeviceProxy channel as an opaque idevice_connection_t in *out_conn; the
- * caller wraps it in a conn_t and runs the CoreDeviceProxy handshake + pump over it. Fills the
- * chosen udid, device name and iOS version. Returns 0 on success. */
-int imd_bringup(void **out_conn, char *udid_out, size_t udidlen,
+ * caller wraps it in a conn_t and runs the CoreDeviceProxy handshake + pump over it. Binds the
+ * device imd_pick_device(want) chooses and fills its udid, name and iOS version. Returns 0 on
+ * success; on failure everything it opened is released, so the caller may simply try again.
+ * Guarded by a 30 s watchdog that exits the process if a library call hangs (see imd.c). */
+int imd_bringup(const char *want, void **out_conn, char *udid_out, size_t udidlen,
                 char *devname, size_t dnlen, char *prodver, size_t pvlen);
 int imd_conn_send(void *conn, const void *buf, size_t n);
 int imd_conn_recv(void *conn, void *buf, size_t n);
+/* Drop a connection imd_bringup returned (and the device handle it rides on), when bring-up fails
+ * after it -- e.g. the CoreDeviceProxy handshake -- and the caller goes back to waiting. */
+void imd_conn_close(void *conn);
 
 /* Bind a different device. Does not return on success.
  *
@@ -108,7 +127,41 @@ typedef struct {
     double      keyframe_every_s;
 } api_session;
 
-/* Serve until the process is killed. Returns non-zero if the listeners could not be created. */
+/* Where the engine stands, as list_devices reports it ("engine_state"). */
+typedef enum {
+    API_ENGINE_WAITING = 0,   /* API up, no session: no device yet, or usbmuxd unreachable */
+    API_ENGINE_BINDING,       /* a device was found and bring-up is in progress */
+    API_ENGINE_READY          /* a session is bound; every method is available */
+} api_engine_state;
+
+/* Bind 9876/9877/9878 and start serving on a background thread, before any device is bound.
+ * `session` must stay valid for the process lifetime; its fields are read only once the state is
+ * READY. Returns non-zero if the listeners could not be created (another cdhost running). */
+int  api_start(api_session *session);
+void api_set_engine_state(api_engine_state st);
+api_engine_state api_engine_state_get(void);
+/* The last bring-up failure, shown as list_devices' "engine_error" while not ready; NULL clears. */
+void api_set_engine_error(const char *msg);
+/* Close every listening and streaming socket (the Windows rebind path, so the relaunched engine
+ * can bind the same ports). The API stops answering. */
+void api_close_listeners(void);
+/* Block until the accept loop stops (it normally never does). */
+void api_wait(void);
+
+/* The userspace tunnel's connection ended (usernet.c's reader). Restarts the engine so it goes
+ * back to waiting for the device instead of serving a dead session. Does not return. */
+void cdhost_tunnel_died(const char *why);
+
+/* The 30 s bring-up watchdog fired (imd.c, on its own thread): relaunch the engine with the same
+ * device preference, the stuck device starting in backoff. Exits with code 2 only if the relaunch
+ * itself fails. Does not return. */
+void cdhost_bringup_timed_out(void);
+
+/* While bring-up is in progress, the udid being bound (returns 1 and fills `out`); else 0. */
+int cdhost_binding_udid(char *out, size_t cap);
+
+/* api_start + mark the session ready + serve until the process is killed. Returns non-zero if the
+ * listeners could not be created. */
 int api_serve(api_session *session);
 
 #endif /* API_SERVER_H */

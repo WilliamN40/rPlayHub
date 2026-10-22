@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #endif
 #include <pthread.h>
 #include <signal.h>
@@ -36,6 +37,18 @@
 #define SVC_REASSEMBLY (32u << 20)
 
 static api_session *g_session;
+
+/* The three ports. Defaults are the contract (API_PORT/STREAM_PORT/AUDIO_PORT); RPLAY_API_PORT,
+ * RPLAY_STREAM_PORT and RPLAY_AUDIO_PORT move them, so a second engine (a test, a mock beside a
+ * real one) can run without colliding. Clients find them in their own configuration. */
+static int g_api_port = API_PORT, g_stream_port = STREAM_PORT, g_audio_port = AUDIO_PORT;
+
+static int port_from_env(const char *name, int fallback)
+{
+    const char *v = getenv(name);
+    long p = (v && *v) ? strtol(v, NULL, 10) : 0;
+    return (p > 0 && p < 65536) ? (int)p : fallback;
+}
 
 /* The live stream and its viewers. Declared here because stream_info reports on them and is
  * defined above the fan-out that owns them. */
@@ -179,6 +192,72 @@ static void reply_error(int fd, long id, const char *code, const char *message)
               id, code, message);
 }
 
+/* Whether a KERNEL socket has something to read (data, or the peer's hang-up) within `ms`. */
+static int sock_readable(int fd, int ms)
+{
+#ifdef _WIN32
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET((SOCKET)fd, &rd);
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+    return select(0, &rd, NULL, NULL, &tv) > 0;
+#else
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    return poll(&p, 1, ms) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR));
+#endif
+}
+
+/* ------------------------------------------------------------------ engine state
+ *
+ * The API comes up before any device is bound, so the GUI always has a daemon to talk to: it can
+ * list devices, see that Apple's mux is missing, and select a phone, all while nothing is bound.
+ * main() (cdhost.c) moves this through waiting -> binding -> ready as it brings a device up. */
+static volatile int g_engine_state = API_ENGINE_WAITING;
+static pthread_mutex_t g_engine_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_engine_error[256];
+static void ensure_media(void);
+static void ensure_audio(void);
+static int viewers_waiting(void);
+static int listeners_waiting(void);
+
+api_engine_state api_engine_state_get(void) { return (api_engine_state)__atomic_load_n(&g_engine_state, __ATOMIC_SEQ_CST); }
+
+static const char *engine_state_name(api_engine_state st)
+{
+    return st == API_ENGINE_READY ? "ready" : st == API_ENGINE_BINDING ? "binding" : "waiting_for_device";
+}
+
+void api_set_engine_state(api_engine_state st)
+{
+    __atomic_store_n(&g_engine_state, (int)st, __ATOMIC_SEQ_CST);
+    if (st != API_ENGINE_READY) return;
+    /* Viewers or listeners that connected while nothing was bound have been held open; start
+     * their streams now rather than leaving them on a socket that never carries anything. */
+    if (viewers_waiting()) ensure_media();
+    if (listeners_waiting()) ensure_audio();
+}
+
+void api_set_engine_error(const char *msg)
+{
+    pthread_mutex_lock(&g_engine_mu);
+    snprintf(g_engine_error, sizeof g_engine_error, "%s", msg ? msg : "");
+    pthread_mutex_unlock(&g_engine_mu);
+}
+
+static int session_ready(void) { return api_engine_state_get() == API_ENGINE_READY; }
+
+/* Methods that talk to the device need a bound session; say so plainly rather than dereferencing
+ * ports that are still zero. */
+static int need_session(int fd, long id)
+{
+    if (session_ready()) return 1;
+    reply_error(fd, id, "no_device",
+                api_engine_state_get() == API_ENGINE_BINDING
+                    ? "no device bound yet -- the engine is still bringing the device up"
+                    : "no device bound -- the engine is waiting for a device");
+    return 0;
+}
+
 
 static long svc_read(void *ctx, void *buf, size_t len)  { return tun_read(*(int *)ctx, buf, len); }
 static long svc_write(void *ctx, const void *buf, size_t len) { return tun_write(*(int *)ctx, buf, len); }
@@ -240,9 +319,9 @@ static void make_uuid(char out[37])
 {
     static unsigned long counter;
     unsigned long a = (unsigned long)time(NULL), b = ++counter;
-    snprintf(out, 37, "%08lx-%04lx-4%03lx-8%03lx-%012lx",
+    snprintf(out, 37, "%08lx-%04lx-4%03lx-8%03lx-%012llx",
              a & 0xFFFFFFFF, (b >> 16) & 0xFFFF, b & 0xFFF, (a >> 8) & 0xFFF,
-             (a ^ (b << 8)) & 0xFFFFFFFFFFFFUL);
+             (unsigned long long)(((unsigned long long)a ^ ((unsigned long long)b << 8)) & 0xFFFFFFFFFFFFULL));
 }
 
 static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -403,6 +482,15 @@ static void touch_report(uint8_t out[58], uint8_t state, uint16_t x, uint16_t y)
     for (int i = 0; i < 6; i++) out[44 + i] = (uint8_t)(stamp >> (8 * i));
 }
 
+/* Pace a gesture. 64-bit, because duration_ms * 1e6 overflows a 32-bit long (Windows) past
+ * 2.1 s, and split into seconds because nanosleep rejects tv_nsec >= 1e9. */
+static void sleep_ns(int64_t ns)
+{
+    if (ns <= 0) return;
+    struct timespec sl = { (time_t)(ns / 1000000000LL), (long)(ns % 1000000000LL) };
+    nanosleep(&sl, NULL);
+}
+
 static int hid_send(rp_rxpc_session *s, const uint8_t report[58])
 {
     uint8_t body[512];
@@ -479,8 +567,7 @@ static void method_button(int fd, long id, const char *line)
         uint16_t py = (uint16_t)((from_y + (to_y - from_y) * t) * 65535.0);
         touch_report(report, TS_STATE_CONTACT, px, py);
         if (hid_send(&c.s, report) != 0) break;
-        struct timespec sl = {0, (long)(duration * 1000000L / (steps + 1))};
-        nanosleep(&sl, NULL);
+        sleep_ns((int64_t)duration * 1000000LL / (steps + 1));
     }
     touch_report(report, TS_STATE_RELEASE, (uint16_t)(x * 65535.0), (uint16_t)(to_y * 65535.0));
     hid_send(&c.s, report);
@@ -510,6 +597,8 @@ static void method_touch(int fd, long id, const char *line, int is_swipe)
         return;
     }
     long duration = json_number_field(line, "duration_ms", is_swipe ? 300 : 60);
+    if (duration < 0) duration = 0;
+    if (duration > 600000) duration = 600000;    /* ten minutes is not a gesture */
 
     svc_conn c;
     if (svc_open(&c, sess->tunnel_addr, sess->hid_port) != 0) {
@@ -526,8 +615,7 @@ static void method_touch(int fd, long id, const char *line, int is_swipe)
         uint16_t y = (uint16_t)((fy + (fy1 - fy) * t) * 65535.0);
         touch_report(report, TS_STATE_CONTACT, x, y);
         if (hid_send(&c.s, report) != 0) break;
-        struct timespec sl = {0, (long)(duration * 1000000L / (steps + 1))};
-        nanosleep(&sl, NULL);
+        sleep_ns((int64_t)duration * 1000000LL / (steps + 1));
     }
     touch_report(report, TS_STATE_RELEASE,
                  (uint16_t)(fx1 * 65535.0), (uint16_t)(fy1 * 65535.0));
@@ -556,6 +644,9 @@ static int relay_open(const api_session *sess, long port, int read_timeout_s)
     return tun_connect(sess->tunnel_addr, (int)port, 3);
 }
 
+/* Exact-length reads and writes on a TUNNEL fd (lwIP or kernel, routed by tun_*). Never use
+ * plain recv()/send() on these: in userspace mode the fd is an lwIP socket, and handing it to
+ * Winsock/libc reads or writes some unrelated descriptor -- or nothing at all. */
 static int recvn(int fd, uint8_t *buf, size_t n)
 {
     size_t got = 0;
@@ -567,13 +658,25 @@ static int recvn(int fd, uint8_t *buf, size_t n)
     return 0;
 }
 
+static int sendn(int fd, const void *buf, size_t n)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0;
+    while (off < n) {
+        long w = tun_write(fd, p + off, n - off);
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
 /* Send one plist body (already framed by the caller) and read one reply. Replies may be XML or
  * binary plists; both carry ASCII field names verbatim, so substring matching below works on
  * either -- the same trick the Python prototype relies on via plistlib's auto-detection. */
 static int relay_send(int fd, const char *xml, size_t n)
 {
     uint8_t head[4] = { (uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n };
-    if (tun_write(fd, head, 4) != 4 || tun_write(fd, xml, n) != (ssize_t)n) return -1;
+    if (sendn(fd, head, 4) != 0 || sendn(fd, xml, n) != 0) return -1;
     return 0;
 }
 
@@ -657,17 +760,17 @@ static void method_device_action(int fd, long id, const char *line)
         return;
     }
     const char *err = relay_checkin(s);
-    if (err) { close(s); reply_error(fd, id, "internal_error", err); return; }
+    if (err) { tun_close(s); reply_error(fd, id, "internal_error", err); return; }
 
     char reply[4096];
     if (relay_send_request(s, request, NULL, reply, sizeof reply) != 0) {
-        close(s);
+        tun_close(s);
         reply_error(fd, id, "internal_error",
                     "no reply from diagnostics_relay; on shutdown the device may power off "
                     "mid-reply -- check whether the action took effect anyway");
         return;
     }
-    close(s);
+    tun_close(s);
 
     /* The action reply's only field is Status; "Success" appears verbatim in XML and binary. */
     if (strstr(reply, "Success") && !strstr(reply, "Failure"))
@@ -902,7 +1005,7 @@ static void method_list_apps(int fd, long id, const char *line)
     int s = relay_open(sess, sess->instproxy_port, 30);
     if (s < 0) { reply_error(fd, id, "unavailable", "cannot reach installation_proxy through the tunnel"); return; }
     const char *err = relay_checkin(s);
-    if (err) { close(s); reply_error(fd, id, "internal_error", err); return; }
+    if (err) { tun_close(s); reply_error(fd, id, "internal_error", err); return; }
 
     static const char browse[] =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -922,7 +1025,7 @@ static void method_list_apps(int fd, long id, const char *line)
         "\t\t\t<string>IsAppClip</string>\n"
         "\t\t</array>\n\t</dict>\n</dict>\n</plist>\n";
     if (relay_send(s, browse, sizeof browse - 1) != 0) {
-        close(s);
+        tun_close(s);
         reply_error(fd, id, "internal_error", "could not send Browse");
         return;
     }
@@ -976,7 +1079,7 @@ static void method_list_apps(int fd, long id, const char *line)
         plist_free(pl);
         free(raw);
     }
-    close(s);
+    tun_close(s);
     if (failed || b.oom) {
         free(b.p);
         reply_error(fd, id, "device_error", "installation_proxy Browse did not complete");
@@ -1101,7 +1204,7 @@ static void method_list_profiles(int fd, long id)
 
     if (sess->misagent_port) {
         int s = relay_open(sess, sess->misagent_port, 15);
-        if (s < 0 || (err = relay_checkin(s)) != NULL) { if (s >= 0) close(s); if (!err) err = "cannot reach misagent"; }
+        if (s < 0 || (err = relay_checkin(s)) != NULL) { if (s >= 0) tun_close(s); if (!err) err = "cannot reach misagent"; }
         else {
             static const char req[] =
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n"
@@ -1109,7 +1212,7 @@ static void method_list_profiles(int fd, long id)
                 "\t<key>ProfileType</key>\n\t<string>Provisioning</string>\n</dict>\n</plist>\n";
             size_t n = 0;
             uint8_t *raw = relay_send(s, req, sizeof req - 1) == 0 ? relay_recv_alloc(s, &n) : NULL;
-            close(s);
+            tun_close(s);
             plist_t pl = NULL;
             if (raw) plist_from_memory((const char *)raw, (uint32_t)n, &pl, NULL);
             plist_t payload = (pl && plist_get_node_type(pl) == PLIST_DICT) ? plist_dict_get_item(pl, "Payload") : NULL;
@@ -1152,14 +1255,14 @@ static void method_list_profiles(int fd, long id)
     if (sess->mcinstall_port) {
         int s = relay_open(sess, sess->mcinstall_port, 15);
         const char *e2 = NULL;
-        if (s < 0 || (e2 = relay_checkin(s)) != NULL) { if (s >= 0) close(s); if (!err) err = e2 ? e2 : "cannot reach MCInstall"; }
+        if (s < 0 || (e2 = relay_checkin(s)) != NULL) { if (s >= 0) tun_close(s); if (!err) err = e2 ? e2 : "cannot reach MCInstall"; }
         else {
             static const char req[] =
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n"
                 "\t<key>RequestType</key>\n\t<string>GetProfileList</string>\n</dict>\n</plist>\n";
             size_t n = 0;
             uint8_t *raw = relay_send(s, req, sizeof req - 1) == 0 ? relay_recv_alloc(s, &n) : NULL;
-            close(s);
+            tun_close(s);
             plist_t pl = NULL;
             if (raw) plist_from_memory((const char *)raw, (uint32_t)n, &pl, NULL);
             if (pl && plist_get_node_type(pl) == PLIST_DICT) {
@@ -1232,15 +1335,15 @@ static void relay_plist_run(int fd, long id, long port, const uint8_t *xml, size
     int s = relay_open(sess, port, 15);
     if (s < 0) { reply_error(fd, id, "unavailable", "cannot reach the service through the tunnel"); return; }
     const char *err = relay_checkin(s);
-    if (err) { close(s); reply_error(fd, id, "internal_error", err); return; }
+    if (err) { tun_close(s); reply_error(fd, id, "internal_error", err); return; }
     if (relay_send(s, (const char *)xml, xml_len) != 0) {
-        close(s);
+        tun_close(s);
         reply_error(fd, id, "internal_error", "could not send request");
         return;
     }
     size_t n = 0;
     uint8_t *raw = relay_recv_alloc(s, &n);
-    close(s);
+    tun_close(s);
     if (!raw) { reply_error(fd, id, "device_error", "no reply from the device"); return; }
     plist_t pl = NULL;
     plist_from_memory((const char *)raw, (uint32_t)n, &pl, NULL);
@@ -1395,7 +1498,7 @@ static int afc_open(afc_conn *c, const api_session *sess, long port, const char 
     c->fd = relay_open(sess, port, 30);
     if (c->fd < 0) { *err = "cannot reach the AFC service through the tunnel"; return -1; }
     const char *e = relay_checkin(c->fd);
-    if (e) { close(c->fd); c->fd = -1; *err = e; return -1; }
+    if (e) { tun_close(c->fd); c->fd = -1; *err = e; return -1; }
     return 0;
 }
 
@@ -1407,8 +1510,8 @@ static int afc_send(afc_conn *c, uint64_t op, const uint8_t *payload, size_t n)
     put_u64le(hdr + 16, 40 + n);
     put_u64le(hdr + 24, c->seq++);
     put_u64le(hdr + 32, op);
-    if (send(c->fd, hdr, 40, 0) != 40) return -1;
-    if (n && send(c->fd, payload, n, 0) != (ssize_t)n) return -1;
+    if (sendn(c->fd, hdr, 40) != 0) return -1;
+    if (n && sendn(c->fd, payload, n) != 0) return -1;
     return 0;
 }
 
@@ -1591,9 +1694,9 @@ static int instproxy_run(int fd, long id, const char *xml, size_t xml_len, const
     int s = relay_open(sess, sess->instproxy_port, 30);
     if (s < 0) { reply_error(fd, id, "unavailable", "cannot reach installation_proxy through the tunnel"); return -1; }
     const char *err = relay_checkin(s);
-    if (err) { close(s); reply_error(fd, id, "internal_error", err); return -1; }
+    if (err) { tun_close(s); reply_error(fd, id, "internal_error", err); return -1; }
     if (relay_send(s, xml, xml_len) != 0) {
-        close(s);
+        tun_close(s);
         reply_error(fd, id, "internal_error", "could not send request");
         return -1;
     }
@@ -1625,7 +1728,7 @@ static int instproxy_run(int fd, long id, const char *xml, size_t xml_len, const
         }
         plist_free(pl);
     }
-    close(s);
+    tun_close(s);
     strbuf b = {0};
     if (failed) {
         sb_printf(&b, "{\"id\":%ld,\"ok\":false,\"error\":{\"code\":\"device_error\",\"message\":", id);
@@ -1663,8 +1766,9 @@ static void method_install_app(int fd, long id, const char *line)
     }
     fclose(f);
 
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
+    /* The file name goes on the device; the directory is local and may use either separator. */
+    const char *base = path;
+    for (const char *q = path; *q; q++) if (*q == '/' || *q == '\\') base = q + 1;
     char staged[1200];
     snprintf(staged, sizeof staged, "PublicStaging/%s", base);
 
@@ -1672,7 +1776,7 @@ static void method_install_app(int fd, long id, const char *line)
     if (afc_open(&c, sess, sess->afc_port, &err) != 0) { free(data); reply_error(fd, id, "unavailable", err); return; }
     afc_make_dir(&c, "PublicStaging");  /* ignore -- exists after the first install */
     int wrc = afc_write_file(&c, staged, data, (size_t)fsize);
-    close(c.fd);
+    tun_close(c.fd);
     free(data);
     if (wrc != 0) { reply_error(fd, id, "device_error", "could not stage the app over AFC"); return; }
 
@@ -1727,7 +1831,7 @@ static void method_get_app_icon(int fd, long id, const char *line)
     int s = relay_open(sess, sess->sbservices_port, 15);
     if (s < 0) { reply_error(fd, id, "unavailable", "cannot reach springboardservices through the tunnel"); return; }
     const char *err = relay_checkin(s);
-    if (err) { close(s); reply_error(fd, id, "internal_error", err); return; }
+    if (err) { tun_close(s); reply_error(fd, id, "internal_error", err); return; }
 
     char bid_esc[300];
     xml_escape(bid, bid_esc, sizeof bid_esc);
@@ -1737,13 +1841,13 @@ static void method_get_app_icon(int fd, long id, const char *line)
         "\t<key>command</key>\n\t<string>getIconPNGData</string>\n"
         "\t<key>bundleId</key>\n\t<string>%s</string>\n</dict>\n</plist>\n", bid_esc);
     if (n <= 0 || (size_t)n >= sizeof xml || relay_send(s, xml, (size_t)n) != 0) {
-        close(s);
+        tun_close(s);
         reply_error(fd, id, "internal_error", "could not send getIconPNGData");
         return;
     }
     size_t raw_n = 0;
     uint8_t *raw = relay_recv_alloc(s, &raw_n);
-    close(s);
+    tun_close(s);
     if (!raw) { reply_error(fd, id, "device_error", "no reply from the device"); return; }
     plist_t pl = NULL;
     plist_from_memory((const char *)raw, (uint32_t)raw_n, &pl, NULL);
@@ -1793,7 +1897,7 @@ static void crash_mover_poke(const api_session *sess)
     int s = relay_open(sess, sess->crashmover_port, 15);
     if (s < 0) return;
     if (relay_checkin(s) == NULL) { char ping[4]; recvn(s, (uint8_t *)ping, 4); }
-    close(s);
+    tun_close(s);
 }
 
 static void method_list_dir(int fd, long id, const char *line)
@@ -1813,7 +1917,7 @@ static void method_list_dir(int fd, long id, const char *line)
     sb_json_string(&b, path);
     sb_puts(&b, ",\"entries\":");
     int rc = afc_readdir(&c, path, &b, 1);
-    close(c.fd);
+    tun_close(c.fd);
     if (rc != 0) {
         free(b.p);
         char msg[96];
@@ -1839,7 +1943,7 @@ static void method_read_file(int fd, long id, const char *line)
     if (afc_open(&c, sess, port, &err) != 0) { reply_error(fd, id, "unavailable", err); return; }
     size_t n = 0;
     uint8_t *data = afc_read_file(&c, path, &n);
-    close(c.fd);
+    tun_close(c.fd);
     if (!data) { reply_error(fd, id, "device_error", "could not read the file (missing, a directory, or over 64 MB)"); return; }
     size_t b64cap = ((n + 2) / 3) * 4 + 1;
     char *b64 = malloc(b64cap);
@@ -1866,7 +1970,7 @@ static void method_export_crashes(int fd, long id, const char *line)
     afc_conn c; const char *err;
     if (afc_open(&c, sess, sess->crashcopy_port, &err) != 0) { reply_error(fd, id, "unavailable", err); return; }
     strbuf names = {0};
-    if (afc_readdir(&c, "/", &names, 0) != 0 || !names.p) { close(c.fd); free(names.p); reply_error(fd, id, "device_error", "could not list crash reports"); return; }
+    if (afc_readdir(&c, "/", &names, 0) != 0 || !names.p) { tun_close(c.fd); free(names.p); reply_error(fd, id, "device_error", "could not list crash reports"); return; }
     mkdir(dir, 0755);
     int copied = 0, failed = 0;
     /* names.p is [{"name":"..."},...]; walk it with the tiny JSON helper. */
@@ -1890,7 +1994,7 @@ static void method_export_crashes(int fd, long id, const char *line)
         if (f) { fwrite(data, 1, n, f); fclose(f); copied++; } else failed++;
         free(data);
     }
-    close(c.fd);
+    tun_close(c.fd);
     free(names.p);
     send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{\"copied\":%d,\"failed\":%d,\"dir\":\"%s\"}}", id, copied, failed, dir);
 }
@@ -1912,22 +2016,20 @@ static void method_syslog(int fd, long id)
     int s = relay_open(sess, sess->syslog_port, 5);
     if (s < 0) { reply_error(fd, id, "unavailable", "cannot reach syslog_relay through the tunnel"); return; }
     const char *err = relay_checkin(s);
-    if (err) { close(s); reply_error(fd, id, "internal_error", err); return; }
+    if (err) { tun_close(s); reply_error(fd, id, "internal_error", err); return; }
     send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{\"streaming\":true}}", id);
 
+    /* Two things to watch: the relay (a TUNNEL fd -- an lwIP socket in userspace mode) and the
+     * API client (a kernel socket). One select() cannot cover both, since lwIP's select is
+     * compiled out and Winsock's knows nothing of lwIP fds, so poll: a short deadline on the relay
+     * read, and a zero-wait readability check on the client between reads. A client that sends
+     * anything or hangs up shows as readable and ends the stream within ~250 ms. */
     char acc[16384];
     size_t acc_len = 0;
     for (;;) {
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(s, &rd);
-        FD_SET(fd, &rd);
-        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
-        int n = select((s > fd ? s : fd) + 1, &rd, NULL, NULL, &tv);
-        if (n < 0) break;
-        if (FD_ISSET(fd, &rd)) break;            /* client spoke or hung up: done */
-        if (!FD_ISSET(s, &rd)) continue;
-        ssize_t r = recv(s, acc + acc_len, sizeof acc - acc_len - 1, 0);
+        if (sock_readable(fd, 0)) break;         /* client spoke or hung up: done */
+        long r = tun_read_timeout(s, acc + acc_len, sizeof acc - acc_len - 1, 250);
+        if (r == TUN_TIMEOUT) continue;
         if (r <= 0) break;
         acc_len += (size_t)r;
 
@@ -1949,7 +2051,7 @@ static void method_syslog(int fd, long id)
         acc_len -= start;
         if (acc_len == sizeof acc - 1) acc_len = 0;   /* a line longer than the buffer: drop it */
     }
-    close(s);
+    tun_close(s);
 }
 
 /* ------------------------------------------------------------------ methods */
@@ -1969,7 +2071,7 @@ static void method_device_info(int fd, long id, const char *line)
 {
     char udid[64] = {0};
     json_string_field(line, "udid", udid, sizeof udid);
-    if (!udid[0] && g_session->udid) snprintf(udid, sizeof udid, "%s", g_session->udid);
+    if (!udid[0] && session_ready() && g_session->udid) snprintf(udid, sizeof udid, "%s", g_session->udid);
     if (!udid[0]) { reply_error(fd, id, "bad_request", "udid is required"); return; }
     size_t cap = 64 * 1024;
     char *json = malloc(cap);
@@ -2023,7 +2125,13 @@ static void method_select_device(int fd, long id, const char *line)
         reply_error(fd, id, "bad_request", "udid is required");
         return;
     }
-    if (g_session->udid && !strcmp(g_session->udid, udid)) {
+    if (session_ready() && g_session->udid && !strcmp(g_session->udid, udid)) {
+        send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{\"rebinding\":false}}", id);
+        return;
+    }
+    /* Already being brought up: selecting it again must not restart the engine mid-bring-up. */
+    char binding[64];
+    if (cdhost_binding_udid(binding, sizeof binding) && !strcmp(binding, udid)) {
         send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{\"rebinding\":false}}", id);
         return;
     }
@@ -2033,12 +2141,13 @@ static void method_select_device(int fd, long id, const char *line)
     int known = 0;
     for (int i = 0; i < n; i++) if (!strcmp(devs[i].udid, udid)) { known = 1; break; }
     if (!known) {
-        reply_error(fd, id, "unavailable", "that device is not attached");
+        reply_error(fd, id, "unavailable", n < 0 ? "usbmuxd is not reachable" : "that device is not attached");
         return;
     }
 
     send_line(fd, "{\"id\":%ld,\"ok\":true,\"result\":{\"rebinding\":true}}", id);
-    /* Give the reply a moment to leave before the process is replaced. */
+    /* Give the reply a moment to leave before the process is replaced. (While nothing is bound
+     * cdhost_rebind just hands the choice to the waiting loop and returns.) */
     usleep(150000);
     cdhost_rebind(udid);
 }
@@ -2054,39 +2163,63 @@ static void method_list_devices(int fd, long id)
      * other looked disconnected -- and "connection" always read "usb" even over wifi. Only the
      * bound device carries a screen size; names, versions and product types come from
      * usbmux_enumerate's own lockdown queries, with the udid as the fallback title. */
-    char buf[4096];
-    int off = snprintf(buf, sizeof buf, "{\"id\":%ld,\"ok\":true,\"result\":{\"devices\":[", id);
+    /* Only a READY session counts as bound: while binding, main() is still filling it in. */
+    int ready = session_ready() && s->udid && s->udid[0];
+    char binding_udid[64] = "";
+    int binding = cdhost_binding_udid(binding_udid, sizeof binding_udid);
+    int usbmuxd_up = n >= 0;
+    if (n < 0) n = 0;
+
+    strbuf b = {0};
+    sb_printf(&b, "{\"id\":%ld,\"ok\":true,\"result\":{\"devices\":[", id);
     int wrote = 0;
-    for (int i = 0; i < n && off < (int)sizeof buf - 512; i++) {
-        int bound = s->udid && !strcmp(devs[i].udid, s->udid);
+    for (int i = 0; i < n; i++) {
+        int bound = ready && !strcmp(devs[i].udid, s->udid);
         const char *name = devs[i].name[0] ? devs[i].name : bound ? s->device_name : devs[i].udid;
         const char *ver = devs[i].version[0] ? devs[i].version : bound ? s->product_version : "";
-        off += snprintf(buf + off, sizeof buf - off,
-                        "%s{\"udid\":\"%s\",\"name\":\"%s\","
-                        "\"os_version\":\"%s\",\"product_version\":\"%s\","
-                        "\"product_type\":\"%s\","
-                        "\"screen_width\":%d,\"screen_height\":%d,"
-                        "\"connection\":\"%s\",\"bound\":%s}",
-                        wrote ? "," : "", devs[i].udid, name, ver, ver, devs[i].product_type,
-                        bound ? s->screen_w : 0, bound ? s->screen_h : 0,
-                        strcmp(devs[i].connection, "Network") ? "usb" : "wifi",
-                        bound ? "true" : "false");
+        sb_puts(&b, wrote ? ",{\"udid\":" : "{\"udid\":");
+        sb_json_string(&b, devs[i].udid);
+        sb_puts(&b, ",\"name\":");            sb_json_string(&b, name ? name : "");
+        sb_puts(&b, ",\"os_version\":");      sb_json_string(&b, ver ? ver : "");
+        sb_puts(&b, ",\"product_version\":"); sb_json_string(&b, ver ? ver : "");
+        sb_puts(&b, ",\"product_type\":");    sb_json_string(&b, devs[i].product_type);
+        sb_printf(&b, ",\"screen_width\":%d,\"screen_height\":%d,\"connection\":\"%s\",\"bound\":%s,"
+                      "\"binding\":%s}",
+                  bound ? s->screen_w : 0, bound ? s->screen_h : 0,
+                  strcmp(devs[i].connection, "Network") ? "usb" : "wifi",
+                  bound ? "true" : "false",
+                  binding && !strcmp(devs[i].udid, binding_udid) ? "true" : "false");
         wrote++;
     }
     /* usbmuxd can be unreachable while the session is very much alive -- it is a separate daemon
      * and the tunnel does not depend on it once up. Reporting nothing then would blank a sidebar
      * that is actively mirroring, so fall back to the session we know we have. */
-    if (!wrote && s->udid) {
-        off += snprintf(buf + off, sizeof buf - off,
-                        "{\"udid\":\"%s\",\"name\":\"%s\","
-                        "\"os_version\":\"%s\",\"product_version\":\"%s\","
-                        "\"screen_width\":%d,\"screen_height\":%d,"
-                        "\"connection\":\"usb\",\"bound\":true}",
-                        s->udid, s->device_name, s->product_version, s->product_version,
-                        s->screen_w, s->screen_h);
+    if (!wrote && ready) {
+        sb_puts(&b, "{\"udid\":");            sb_json_string(&b, s->udid);
+        sb_puts(&b, ",\"name\":");            sb_json_string(&b, s->device_name ? s->device_name : "");
+        sb_puts(&b, ",\"os_version\":");      sb_json_string(&b, s->product_version ? s->product_version : "");
+        sb_puts(&b, ",\"product_version\":"); sb_json_string(&b, s->product_version ? s->product_version : "");
+        sb_printf(&b, ",\"screen_width\":%d,\"screen_height\":%d,\"connection\":\"usb\",\"bound\":true}",
+                  s->screen_w, s->screen_h);
     }
-    snprintf(buf + off, sizeof buf - off, "]}}");
-    send_line(fd, "%s", buf);
+    /* Engine status, so the GUI can explain an empty list instead of just showing one: whether
+     * Apple's mux is reachable at all (missing vs. merely no phone), and where bring-up stands. */
+    sb_printf(&b, "],\"usbmuxd\":%s", usbmuxd_up ? "true" : "false");
+    if (!usbmuxd_up) {
+        sb_puts(&b, ",\"usbmuxd_error\":");
+        sb_json_string(&b, USBMUXD_MISSING_MESSAGE);
+    }
+    sb_printf(&b, ",\"engine_state\":\"%s\"", engine_state_name(api_engine_state_get()));
+    pthread_mutex_lock(&g_engine_mu);
+    if (g_engine_error[0] && !ready) {
+        sb_puts(&b, ",\"engine_error\":");
+        sb_json_string(&b, g_engine_error);
+    }
+    pthread_mutex_unlock(&g_engine_mu);
+    sb_puts(&b, "}}\n");
+    if (b.p && !b.oom) send_all(fd, b.p, b.len);
+    else reply_error(fd, id, "internal_error", "out of memory rendering the device list");
+    free(b.p);
 }
 
 static void method_stream_info(int fd, long id)
@@ -2107,14 +2240,14 @@ static void method_stream_info(int fd, long id)
               "\"engine\":\"cdhostd\",\"streaming\":%s,\"viewer_drops\":%llu,"
               "\"display_service_port\":%ld,\"hid_service_port\":%ld,"
               "\"audio\":{\"port\":%d,\"streaming\":%s,\"listeners\":%d,\"frames\":%llu}}}",
-              id, STREAM_PORT, viewer_count,
+              id, g_stream_port, viewer_count,
               (unsigned long long)nals, (unsigned long long)packets,
               (unsigned long long)keys, (unsigned long long)lost,
               loss_pct, mbps, (unsigned long long)acks, (unsigned long long)bad,
               (unsigned long long)late, (unsigned long long)dup,
               g_media ? "true" : "false", (unsigned long long)viewer_drops_total,
-              s->display_port, s->hid_port,
-              AUDIO_PORT, g_audio ? "true" : "false", audio_count,
+              session_ready() ? s->display_port : 0L, session_ready() ? s->hid_port : 0L,
+              g_audio_port, g_audio ? "true" : "false", audio_count,
               (unsigned long long)audio_frames);
 }
 
@@ -2178,14 +2311,14 @@ static void viewers_write(const uint8_t *data, size_t len)
         size_t off = 0;
         int dead = 0, dropped = 0;
         while (off < len) {
-            ssize_t w = send(viewers[i].fd, data + off, len - off, 0);
+            ssize_t w = send(viewers[i].fd, (const char *)data + off, len - off, 0);
             if (w > 0) { off += (size_t)w; continue; }
             if (w < 0 && is_sock_wouldblock()) { dropped = 1; break; }
             dead = 1;
             break;
         }
         if (dead) {
-            close(viewers[i].fd);
+            sock_close(viewers[i].fd);
             viewers[i] = viewers[--viewer_count];
             continue;
         }
@@ -2197,7 +2330,7 @@ static void viewers_write(const uint8_t *data, size_t len)
             if (++viewers[i].behind > 600) {
                 printf("  dropping a viewer that stopped reading (%llu NALs behind)\n",
                        (unsigned long long)viewers[i].dropped);
-                close(viewers[i].fd);
+                sock_close(viewers[i].fd);
                 viewers[i] = viewers[--viewer_count];
                 continue;
             }
@@ -2236,6 +2369,53 @@ static void on_media_nal(void *ctx, const uint8_t *annexb, size_t len,
     viewers_write(annexb, len);
 }
 
+/* The audio listeners (see on_media_audio below). */
+static pthread_mutex_t audio_lock = PTHREAD_MUTEX_INITIALIZER;
+static int audio_fds[MAX_VIEWERS];
+
+/* A held socket whose peer has gone: readable, and a peek finds EOF or an error. (A peer that
+ * sent bytes is left alone; peeking does not consume them.) */
+static int peer_gone(int fd)
+{
+    if (!sock_readable(fd, 0)) return 0;
+    char c;
+    long r = (long)recv(fd, &c, 1, MSG_PEEK);
+    if (r > 0) return 0;
+    if (r == 0) return 1;
+    return !is_sock_wouldblock();
+}
+
+/* Drop viewers and audio listeners that hung up.
+ *
+ * While streaming, viewers_write/on_media_audio notice a dead peer on their next send. But a
+ * connection held while no device is bound -- or after a stream failed to start -- is never
+ * written to, so a client that connected and left stayed in the table: after MAX_VIEWERS such
+ * cycles every new viewer was closed on connect. The accept loop sweeps once a second and before
+ * declaring the table full. */
+static void sweep_held(void)
+{
+    pthread_mutex_lock(&viewers_lock);
+    for (int i = 0; i < viewer_count; ) {
+        if (peer_gone(viewers[i].fd)) {
+            sock_close(viewers[i].fd);
+            viewers[i] = viewers[--viewer_count];
+            continue;
+        }
+        i++;
+    }
+    pthread_mutex_unlock(&viewers_lock);
+    pthread_mutex_lock(&audio_lock);
+    for (int i = 0; i < audio_count; ) {
+        if (peer_gone(audio_fds[i])) {
+            sock_close(audio_fds[i]);
+            audio_fds[i] = audio_fds[--audio_count];
+            continue;
+        }
+        i++;
+    }
+    pthread_mutex_unlock(&audio_lock);
+}
+
 static void viewer_add(int fd)
 {
     /* Non-blocking, so a viewer can never stall the RTP thread. */
@@ -2245,8 +2425,9 @@ static void viewer_add(int fd)
     int sndbuf = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof sndbuf);
 
+    if (viewers_waiting() >= MAX_VIEWERS) sweep_held();
     pthread_mutex_lock(&viewers_lock);
-    if (viewer_count >= MAX_VIEWERS) { pthread_mutex_unlock(&viewers_lock); close(fd); return; }
+    if (viewer_count >= MAX_VIEWERS) { pthread_mutex_unlock(&viewers_lock); sock_close(fd); return; }
     viewers[viewer_count].fd = fd;
     viewers[viewer_count].dropped = 0;
     viewers[viewer_count].behind = 0;
@@ -2256,15 +2437,38 @@ static void viewer_add(int fd)
     /* Prime this viewer so it can decode from its first frame: the full parameter set in
      * VPS, SPS, PPS order, then the last keyframe. */
     for (int i = 0; i < 3; i++)
-        if (ps_len[i]) send(fd, ps_cache[i], ps_len[i], 0);
-    if (keyframe_len) send(fd, keyframe_cache, keyframe_len, 0);
+        if (ps_len[i]) send(fd, (const char *)ps_cache[i], ps_len[i], 0);
+    if (keyframe_len) send(fd, (const char *)keyframe_cache, keyframe_len, 0);
 }
 
 /* The stream is deferred until someone is watching, because the device sends its only unprompted
  * IDR at stream start -- starting early means the first viewer misses it. */
+/* Called from the accept thread (a viewer connects) and from main (the session becomes ready
+ * with viewers already waiting), so starting a stream is serialised: two media_starts would
+ * negotiate two streams, and the device permits one per session. */
+static pthread_mutex_t g_stream_start_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int viewers_waiting(void)
+{
+    pthread_mutex_lock(&viewers_lock);
+    int n = viewer_count;
+    pthread_mutex_unlock(&viewers_lock);
+    return n;
+}
+
+static void ensure_media_locked(void);
+
 static void ensure_media(void)
 {
+    pthread_mutex_lock(&g_stream_start_mu);
+    ensure_media_locked();
+    pthread_mutex_unlock(&g_stream_start_mu);
+}
+
+static void ensure_media_locked(void)
+{
     if (g_media) return;
+    if (!session_ready()) { printf("  viewer held: no device bound yet; the stream starts when one is\n"); return; }
     const api_session *s = g_session;
     if (!s->display_port) { printf("  no displayservice port; cannot stream\n"); return; }
     media_config cfg = {
@@ -2285,8 +2489,7 @@ static void ensure_media(void)
  * startmediastream with type "audio". The frames are forwarded untouched -- the app decodes them
  * with the platform's AAC-ELD decoder -- so this is plumbing only. Listeners are non-blocking and
  * a slow one loses frames rather than holding up the RTP thread, as with video. */
-static pthread_mutex_t audio_lock = PTHREAD_MUTEX_INITIALIZER;
-static int audio_fds[MAX_VIEWERS];
+/* (audio_lock and audio_fds are declared above sweep_held, which also walks them.) */
 
 static void on_media_audio(void *ctx, const uint8_t *frame, size_t len, uint32_t rtp_ts)
 {
@@ -2301,16 +2504,16 @@ static void on_media_audio(void *ctx, const uint8_t *frame, size_t len, uint32_t
     audio_frames++;
     pthread_mutex_lock(&audio_lock);
     for (int i = 0; i < audio_count; ) {
-        ssize_t w = send(audio_fds[i], rec, len + 6, 0);
+        ssize_t w = send(audio_fds[i], (const char *)rec, len + 6, 0);
         if (w < 0 && !is_sock_wouldblock()) {
-            close(audio_fds[i]);
+            sock_close(audio_fds[i]);
             audio_fds[i] = audio_fds[--audio_count];
             continue;
         }
         /* A partial record would desynchronise the framing; a full buffer means the listener is
          * not reading, so it is dropped rather than repaired. */
         if (w >= 0 && (size_t)w != len + 6) {
-            close(audio_fds[i]);
+            sock_close(audio_fds[i]);
             audio_fds[i] = audio_fds[--audio_count];
             continue;
         }
@@ -2324,15 +2527,34 @@ static void audio_add(int fd)
     set_nonblocking(fd);
     int sndbuf = 256 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof sndbuf);
+    if (listeners_waiting() >= MAX_VIEWERS) sweep_held();
     pthread_mutex_lock(&audio_lock);
-    if (audio_count >= MAX_VIEWERS) { pthread_mutex_unlock(&audio_lock); close(fd); return; }
+    if (audio_count >= MAX_VIEWERS) { pthread_mutex_unlock(&audio_lock); sock_close(fd); return; }
     audio_fds[audio_count++] = fd;
     pthread_mutex_unlock(&audio_lock);
 }
 
+static int listeners_waiting(void)
+{
+    pthread_mutex_lock(&audio_lock);
+    int n = audio_count;
+    pthread_mutex_unlock(&audio_lock);
+    return n;
+}
+
+static void ensure_audio_locked(void);
+
 static void ensure_audio(void)
 {
+    pthread_mutex_lock(&g_stream_start_mu);
+    ensure_audio_locked();
+    pthread_mutex_unlock(&g_stream_start_mu);
+}
+
+static void ensure_audio_locked(void)
+{
     if (g_audio) return;
+    if (!session_ready()) { printf("  audio listener held: no device bound yet\n"); return; }
     const api_session *s = g_session;
     if (!s->display_port) { printf("  no displayservice port; no audio\n"); return; }
     media_config cfg = {
@@ -2679,22 +2901,48 @@ static void method_settings_probe(int fd, long id)
 
 /* ------------------------------------------------------------------ server */
 
+static int g_listen_err;     /* sock_errno() of the last listen_on failure, for the message */
+
 static int listen_on(int port)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    int fd = (int)socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { g_listen_err = sock_errno(); return -1; }
     int one = 1;
+#ifdef _WIN32
+    /* NOT SO_REUSEADDR: on Windows that lets a second socket bind a port another process is
+     * already listening on, so a second cdhost would come up "fine" beside the first and the two
+     * would split the clients between them. Exclusive use makes the second bind fail, which is
+     * what the "another cdhost is running" check below relies on. */
+    setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof one);
+#else
+    /* POSIX SO_REUSEADDR only skips TIME_WAIT; it never allows two listeners on one port. */
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+#endif
+    sock_noinherit(fd);
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((uint16_t)port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* local only: this is a developer tool */
     if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, 8) != 0) {
-        close(fd);
+        g_listen_err = sock_errno();
+        sock_close(fd);
         return -1;
     }
     return fd;
+}
+
+/* After a device rebind the new process may start while the old one's ports are still being
+ * released (on Windows the relaunch is a new process, not an exec in place), so a relaunched
+ * engine -- marked by RPLAY_REBOUND=1 from cdhost_rebind -- retries for a while instead of
+ * concluding that another cdhost owns them. */
+static int listen_on_retry(int port, int wait_s)
+{
+    for (int i = 0; ; i++) {
+        int fd = listen_on(port);
+        if (fd >= 0 || i >= wait_s * 4) return fd;
+        usleep(250000);
+    }
 }
 
 static void dispatch(int fd, const char *line)
@@ -2708,36 +2956,38 @@ static void dispatch(int fd, const char *line)
 
     if (!strcmp(method, "ping"))              { method_ping(fd, id); return; }
     if (!strcmp(method, "quit"))              { method_quit(fd, id); return; }
-    if (!strcmp(method, "activate"))          { method_activate(fd, id); return; }
     if (!strcmp(method, "device_info"))       { method_device_info(fd, id, line); return; }
     if (!strcmp(method, "list_devices"))      { method_list_devices(fd, id); return; }
     if (!strcmp(method, "stream_info"))       { method_stream_info(fd, id); return; }
-    if (!strcmp(method, "press_button"))     { method_button(fd, id, line); return; }
-    if (!strcmp(method, "device_action"))    { method_device_action(fd, id, line); return; }
-    if (!strcmp(method, "list_apps"))        { method_list_apps(fd, id, line); return; }
-    if (!strcmp(method, "list_processes"))   { method_list_processes(fd, id); return; }
-    if (!strcmp(method, "launch_app"))       { method_launch_app(fd, id, line); return; }
-    if (!strcmp(method, "terminate_app"))    { method_terminate_app(fd, id, line); return; }
-    if (!strcmp(method, "install_app"))      { method_install_app(fd, id, line); return; }
-    if (!strcmp(method, "uninstall_app"))    { method_uninstall_app(fd, id, line); return; }
-    if (!strcmp(method, "get_app_icon"))     { method_get_app_icon(fd, id, line); return; }
-    if (!strcmp(method, "syslog"))           { method_syslog(fd, id); return; }
-    if (!strcmp(method, "list_profiles"))    { method_list_profiles(fd, id); return; }
-    if (!strcmp(method, "install_profile"))  { method_install_profile(fd, id, line); return; }
-    if (!strcmp(method, "remove_profile"))   { method_remove_profile(fd, id, line); return; }
-    if (!strcmp(method, "list_dir"))         { method_list_dir(fd, id, line); return; }
-    if (!strcmp(method, "read_file"))        { method_read_file(fd, id, line); return; }
-    if (!strcmp(method, "export_crashes"))   { method_export_crashes(fd, id, line); return; }
     if (!strcmp(method, "select_device"))    { method_select_device(fd, id, line); return; }
-    if (!strcmp(method, "tunnel_info"))       { method_tunnel_info(fd, id); return; }
-    if (!strcmp(method, "settings_probe"))    { method_settings_probe(fd, id); return; }
-    if (!strcmp(method, "get_settings"))      { method_get_settings(fd, id); return; }
-    if (!strcmp(method, "set_setting"))       { method_set_setting(fd, id, line); return; }
-    if (!strcmp(method, "set_location"))      { method_set_location(fd, id, line, 0); return; }
-    if (!strcmp(method, "clear_location"))    { method_set_location(fd, id, line, 1); return; }
-    if (!strcmp(method, "take_screenshot"))   { method_screenshot(fd, id); return; }
-    if (!strcmp(method, "tap"))               { method_touch(fd, id, line, 0); return; }
-    if (!strcmp(method, "swipe"))             { method_touch(fd, id, line, 1); return; }
+
+    /* Everything below talks to the bound device: with none bound they answer no_device. */
+    if (!strcmp(method, "activate")) { if (need_session(fd, id)) method_activate(fd, id); return; }
+    if (!strcmp(method, "press_button")) { if (need_session(fd, id)) method_button(fd, id, line); return; }
+    if (!strcmp(method, "device_action")) { if (need_session(fd, id)) method_device_action(fd, id, line); return; }
+    if (!strcmp(method, "list_apps")) { if (need_session(fd, id)) method_list_apps(fd, id, line); return; }
+    if (!strcmp(method, "list_processes")) { if (need_session(fd, id)) method_list_processes(fd, id); return; }
+    if (!strcmp(method, "launch_app")) { if (need_session(fd, id)) method_launch_app(fd, id, line); return; }
+    if (!strcmp(method, "terminate_app")) { if (need_session(fd, id)) method_terminate_app(fd, id, line); return; }
+    if (!strcmp(method, "install_app")) { if (need_session(fd, id)) method_install_app(fd, id, line); return; }
+    if (!strcmp(method, "uninstall_app")) { if (need_session(fd, id)) method_uninstall_app(fd, id, line); return; }
+    if (!strcmp(method, "get_app_icon")) { if (need_session(fd, id)) method_get_app_icon(fd, id, line); return; }
+    if (!strcmp(method, "syslog")) { if (need_session(fd, id)) method_syslog(fd, id); return; }
+    if (!strcmp(method, "list_profiles")) { if (need_session(fd, id)) method_list_profiles(fd, id); return; }
+    if (!strcmp(method, "install_profile")) { if (need_session(fd, id)) method_install_profile(fd, id, line); return; }
+    if (!strcmp(method, "remove_profile")) { if (need_session(fd, id)) method_remove_profile(fd, id, line); return; }
+    if (!strcmp(method, "list_dir")) { if (need_session(fd, id)) method_list_dir(fd, id, line); return; }
+    if (!strcmp(method, "read_file")) { if (need_session(fd, id)) method_read_file(fd, id, line); return; }
+    if (!strcmp(method, "export_crashes")) { if (need_session(fd, id)) method_export_crashes(fd, id, line); return; }
+    if (!strcmp(method, "tunnel_info")) { if (need_session(fd, id)) method_tunnel_info(fd, id); return; }
+    if (!strcmp(method, "settings_probe")) { if (need_session(fd, id)) method_settings_probe(fd, id); return; }
+    if (!strcmp(method, "get_settings")) { if (need_session(fd, id)) method_get_settings(fd, id); return; }
+    if (!strcmp(method, "set_setting")) { if (need_session(fd, id)) method_set_setting(fd, id, line); return; }
+    if (!strcmp(method, "set_location")) { if (need_session(fd, id)) method_set_location(fd, id, line, 0); return; }
+    if (!strcmp(method, "clear_location")) { if (need_session(fd, id)) method_set_location(fd, id, line, 1); return; }
+    if (!strcmp(method, "take_screenshot")) { if (need_session(fd, id)) method_screenshot(fd, id); return; }
+    if (!strcmp(method, "tap")) { if (need_session(fd, id)) method_touch(fd, id, line, 0); return; }
+    if (!strcmp(method, "swipe")) { if (need_session(fd, id)) method_touch(fd, id, line, 1); return; }
 
     /* Named explicitly rather than lumped into one message, so the log says which capability is
      * missing rather than that something is. */
@@ -2780,18 +3030,95 @@ static void *client_thread(void *arg)
         in_len = left;
         if (in_len == sizeof in - 1) in_len = 0;      /* oversized line: drop it */
     }
-    close(fd);
+    sock_close(fd);
     return NULL;
 }
 
 static void spawn_client(int fd)
 {
     pthread_t t;
-    if (pthread_create(&t, NULL, client_thread, (void *)(intptr_t)fd) != 0) { close(fd); return; }
+    if (pthread_create(&t, NULL, client_thread, (void *)(intptr_t)fd) != 0) { sock_close(fd); return; }
     pthread_detach(t);
 }
 
-int api_serve(api_session *session)
+/* The listening sockets, shared with api_close_listeners (the Windows rebind path). */
+static volatile int g_api_fd = -1, g_video_fd = -1, g_audio_fd = -1;
+static volatile int g_listeners_closed;
+
+static int accept_one(int lfd)
+{
+    int fd = (int)accept(lfd, NULL, NULL);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    sock_noinherit(fd);
+    return fd;
+}
+
+static void *accept_loop(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        int api_fd = g_api_fd, video_fd = g_video_fd, audio_fd = g_audio_fd;
+        if (g_listeners_closed || api_fd < 0) break;
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(api_fd, &rd);
+        if (video_fd >= 0) FD_SET(video_fd, &rd);
+        if (audio_fd >= 0) FD_SET(audio_fd, &rd);
+        int maxfd = api_fd > video_fd ? api_fd : video_fd;
+        if (audio_fd > maxfd) maxfd = audio_fd;
+        sweep_held();
+        struct timeval tv = { 1, 0 };     /* wake once a second to sweep held connections */
+        int ready = select(maxfd + 1, &rd, NULL, NULL, &tv);
+        if (ready == 0) continue;
+        if (ready < 0) {
+            if (g_listeners_closed) break;
+#ifdef _WIN32
+            if (sock_errno() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            fprintf(stderr, "  accept loop: select failed: %s\n", sock_strerror(sock_errno()));
+            break;
+        }
+        if (g_listeners_closed) break;
+        if (FD_ISSET(api_fd, &rd)) {
+            int fd = accept_one(api_fd);
+            if (fd >= 0) {
+                printf("  client connected\n");
+                spawn_client(fd);
+            }
+        }
+        if (video_fd >= 0 && FD_ISSET(video_fd, &rd)) {
+            /* Accepted and held. The app treats a refused video port as a fatal disconnect and
+             * retries in a loop, so refusing would look like a broken engine rather than one
+             * whose streaming is not written yet -- or, now, one with no device bound yet. */
+            int fd = accept_one(video_fd);
+            if (fd >= 0) {
+                printf("  viewer connected (%d total)\n", viewer_count + 1);
+                /* Registered first, then the stream started: if the session turns ready between
+                 * the two, either this call or api_set_engine_state's sees the viewer. */
+                viewer_add(fd);
+                ensure_media();
+                media_request_keyframe(g_media);   /* a static screen would leave it black */
+            }
+        }
+        if (audio_fd >= 0 && FD_ISSET(audio_fd, &rd)) {
+            int fd = accept_one(audio_fd);
+            if (fd >= 0) {
+                printf("  audio listener connected (%d total)\n", audio_count + 1);
+                audio_add(fd);
+                ensure_audio();
+            }
+        }
+    }
+    return NULL;
+}
+
+static pthread_t g_accept_thread;
+
+int api_start(api_session *session)
 {
     g_session = session;
 #ifndef _WIN32
@@ -2806,76 +3133,78 @@ int api_serve(api_session *session)
      */
     const char *nopx = getenv("RPLAY_NO_VIDEO_PROXY");
     int want_proxy = !(nopx && *nopx == '1');
+    g_api_port = port_from_env("RPLAY_API_PORT", API_PORT);
+    g_stream_port = port_from_env("RPLAY_STREAM_PORT", STREAM_PORT);
+    g_audio_port = port_from_env("RPLAY_AUDIO_PORT", AUDIO_PORT);
+    const char *rebound = getenv("RPLAY_REBOUND");
+    int wait_s = (rebound && *rebound == '1') ? 15 : 0;
 
-    int api_fd = listen_on(API_PORT);
-    int video_fd = want_proxy ? listen_on(STREAM_PORT) : -1;
+    int api_fd = listen_on_retry(g_api_port, wait_s);
+    int api_err = g_listen_err;
+    int video_fd = want_proxy ? listen_on_retry(g_stream_port, wait_s) : -1;
+    int video_err = g_listen_err;
     /* Not fatal: without it the phone is simply silent, which is how it always was. */
-    int audio_fd = listen_on(AUDIO_PORT);
+    int audio_fd = listen_on_retry(g_audio_port, wait_s);
+    int audio_err = g_listen_err;
     if (api_fd < 0 || (want_proxy && video_fd < 0)) {
-        fprintf(stderr, "  cannot listen on %d/%d: %s\n", API_PORT, STREAM_PORT, strerror(errno));
+        fprintf(stderr, "  cannot listen on %d/%d: %s\n", g_api_port, g_stream_port,
+                sock_strerror(api_fd < 0 ? api_err : video_err));
         fprintf(stderr, "  another cdhost is probably still running -- this one can serve nobody,\n"
                         "  so it is stopping rather than pumping packets for no viewer.\n");
+        if (api_fd >= 0) sock_close(api_fd);
+        if (video_fd >= 0) sock_close(video_fd);
+        if (audio_fd >= 0) sock_close(audio_fd);
         return -1;
     }
-    printf("  control: 127.0.0.1:%d (JSON lines)\n", API_PORT);
+    printf("  control: 127.0.0.1:%d (JSON lines)\n", g_api_port);
     if (want_proxy)
         printf("  video:   127.0.0.1:%d (Annex-B fan-out, optional; a player may instead take "
-               "RTP directly)\n", STREAM_PORT);
+               "RTP directly)\n", g_stream_port);
     else
         printf("  video:   off (RPLAY_NO_VIDEO_PROXY=1) — players take RTP directly\n");
     if (audio_fd >= 0)
-        printf("  audio:   127.0.0.1:%d (AAC-ELD frames, <u16 len><u32 ts><frame>)\n", AUDIO_PORT);
+        printf("  audio:   127.0.0.1:%d (AAC-ELD frames, <u16 len><u32 ts><frame>)\n", g_audio_port);
     else
-        printf("  audio:   cannot listen on %d: %s\n", AUDIO_PORT, strerror(errno));
+        printf("  audio:   cannot listen on %d: %s\n", g_audio_port, sock_strerror(audio_err));
 
-    for (;;) {
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(api_fd, &rd);
-        if (video_fd >= 0) FD_SET(video_fd, &rd);
-        if (audio_fd >= 0) FD_SET(audio_fd, &rd);
-        int maxfd = api_fd > video_fd ? api_fd : video_fd;
-        if (audio_fd > maxfd) maxfd = audio_fd;
-        if (select(maxfd + 1, &rd, NULL, NULL, NULL) < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (FD_ISSET(api_fd, &rd)) {
-            int fd = accept(api_fd, NULL, NULL);
-            if (fd >= 0) {
-                int one = 1;
-                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-                printf("  client connected\n");
-                spawn_client(fd);
-            }
-        }
-        if (video_fd >= 0 && FD_ISSET(video_fd, &rd)) {
-            /* Accepted and held. The app treats a refused video port as a fatal disconnect and
-             * retries in a loop, so refusing would look like a broken engine rather than one
-             * whose streaming is not written yet. */
-            int fd = accept(video_fd, NULL, NULL);
-            if (fd >= 0) {
-                int one = 1;
-                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-                printf("  viewer connected (%d total)\n", viewer_count + 1);
-                ensure_media();
-                viewer_add(fd);
-                media_request_keyframe(g_media);   /* a static screen would leave it black */
-            }
-        }
-        if (audio_fd >= 0 && FD_ISSET(audio_fd, &rd)) {
-            int fd = accept(audio_fd, NULL, NULL);
-            if (fd >= 0) {
-                int one = 1;
-                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-                printf("  audio listener connected (%d total)\n", audio_count + 1);
-                ensure_audio();
-                audio_add(fd);
-            }
-        }
+    g_api_fd = api_fd; g_video_fd = video_fd; g_audio_fd = audio_fd;
+    if (pthread_create(&g_accept_thread, NULL, accept_loop, NULL) != 0) {
+        fprintf(stderr, "  cannot start the accept thread\n");
+        api_close_listeners();
+        return -1;
     }
-    close(api_fd);
-    if (video_fd >= 0) close(video_fd);
-    if (audio_fd >= 0) close(audio_fd);
+    return 0;
+}
+
+void api_close_listeners(void)
+{
+    g_listeners_closed = 1;
+    int a = g_api_fd, v = g_video_fd, u = g_audio_fd;
+    g_api_fd = g_video_fd = g_audio_fd = -1;
+    if (a >= 0) sock_close(a);
+    if (v >= 0) sock_close(v);
+    if (u >= 0) sock_close(u);
+    /* Viewers and listeners too: on Windows an accepted connection still open on a port can keep
+     * a fresh SO_EXCLUSIVEADDRUSE listener from binding it. */
+    pthread_mutex_lock(&viewers_lock);
+    for (int i = 0; i < viewer_count; i++) sock_close(viewers[i].fd);
+    viewer_count = 0;
+    pthread_mutex_unlock(&viewers_lock);
+    pthread_mutex_lock(&audio_lock);
+    for (int i = 0; i < audio_count; i++) sock_close(audio_fds[i]);
+    audio_count = 0;
+    pthread_mutex_unlock(&audio_lock);
+}
+
+void api_wait(void)
+{
+    pthread_join(g_accept_thread, NULL);
+}
+
+int api_serve(api_session *session)
+{
+    if (api_start(session) != 0) return -1;
+    api_set_engine_state(API_ENGINE_READY);
+    pthread_join(g_accept_thread, NULL);
     return 0;
 }

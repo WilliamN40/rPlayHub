@@ -183,7 +183,7 @@ static int read_file(const char *path, uint8_t **out, size_t *n)
 
 static plist_t load_manifest(const char *ddi_dir)
 {
-    char path[1200];
+    char path[1300];   /* ddi_dir is up to 1200 bytes, plus the suffix */
     snprintf(path, sizeof path, "%s/Restore/BuildManifest.plist", ddi_dir);
     uint8_t *b; size_t n;
     if (read_file(path, &b, &n) != 0) return NULL;
@@ -354,17 +354,17 @@ static char *tss_post(const uint8_t *body, size_t blen, size_t *rlen)
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 #endif
         if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
+        sock_close(fd); fd = -1;
     }
     freeaddrinfo(res);
     if (fd < 0) return NULL;
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     SSL *ssl = ctx ? SSL_new(ctx) : NULL;
-    if (!ssl) { if (ctx) SSL_CTX_free(ctx); close(fd); return NULL; }
+    if (!ssl) { if (ctx) SSL_CTX_free(ctx); sock_close(fd); return NULL; }
     SSL_set_tlsext_host_name(ssl, "gs.apple.com");
     SSL_set_fd(ssl, fd);
-    if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return NULL; }
+    if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); sock_close(fd); return NULL; }
 
     char hdr[512];
     int hn = snprintf(hdr, sizeof hdr,
@@ -380,7 +380,7 @@ static char *tss_post(const uint8_t *body, size_t blen, size_t *rlen)
         got += (size_t)r;
     }
     if (resp) resp[got] = 0;
-    SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+    SSL_free(ssl); SSL_CTX_free(ctx); sock_close(fd);
     if (!ok) { free(resp); return NULL; }
     *rlen = got;
     return resp;
@@ -413,16 +413,44 @@ static uint8_t *tss_extract_ticket(const char *resp, size_t rlen, size_t *tlen)
 
 static const char *find_ddi_dir(const char *given, char *buf, size_t cap)
 {
-    const char *candidates[4]; int n = 0;
-    if (given && *given) candidates[n++] = given;
+    const char *candidates[8]; int n = 0;
+    /* An explicit RPLAY_DDI always wins -- it is how a user overrides whatever else is found. */
     const char *env = getenv("RPLAY_DDI"); if (env && *env) candidates[n++] = env;
-    /* Where scripts/fetch-ddi.sh puts it -- the way to get one without Xcode, e.g. on Linux. */
+    if (given && *given) candidates[n++] = given;
+#ifdef _WIN32
+    /* Where the Windows build keeps it: per-user app data (what an in-app or PowerShell fetch
+     * writes), then beside the executable -- iOS_DDI next to cdhost.exe in an installed or
+     * portable layout, ..\deps\iOS_DDI in a source tree (host-c\cdhost.exe). Windows accepts
+     * '/' in the "<dir>/Restore/..." probe below, so mixed separators are fine. */
+    char appdata[1024] = "", exe_ddi[1100] = "", exe_deps[1100] = "";
+    const char *lad = getenv("LOCALAPPDATA");
+    if (lad && *lad) { snprintf(appdata, sizeof appdata, "%s\\rplayhub\\iOS_DDI", lad); candidates[n++] = appdata; }
+    {
+        char exe[1024];
+        DWORD len = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
+        if (len > 0 && len < sizeof exe) {
+            char *slash = NULL;
+            for (char *q = exe; *q; q++) if (*q == '\\' || *q == '/') slash = q;
+            if (slash) {
+                *slash = 0;     /* the directory holding cdhost.exe */
+                snprintf(exe_ddi, sizeof exe_ddi, "%s\\iOS_DDI", exe);
+                snprintf(exe_deps, sizeof exe_deps, "%s\\..\\deps\\iOS_DDI", exe);
+                candidates[n++] = exe_ddi;
+                candidates[n++] = exe_deps;
+            }
+        }
+    }
+#endif
+    /* Where scripts/fetch-ddi.sh puts it -- the way to get one without Xcode, e.g. on Linux (and
+     * under MSYS2, where HOME is set too). */
     char fetched[1024] = "";
     const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
     if (xdg && *xdg) snprintf(fetched, sizeof fetched, "%s/rplayhub/iOS_DDI", xdg);
     else if (home && *home) snprintf(fetched, sizeof fetched, "%s/.local/share/rplayhub/iOS_DDI", home);
     if (fetched[0]) candidates[n++] = fetched;
+#ifndef _WIN32
     candidates[n++] = "/Library/Developer/DeveloperDiskImages/iOS_DDI";
+#endif
     for (int i = 0; i < n; i++) {
         char p[1200]; snprintf(p, sizeof p, "%s/Restore/BuildManifest.plist", candidates[i]);
         struct stat st;
@@ -437,7 +465,12 @@ int cdhost_ddi_activate(const char *addr, long port, const char *ddi_dir_in)
 
     char ddi_dir[1200];
     if (!find_ddi_dir(ddi_dir_in, ddi_dir, sizeof ddi_dir)) {
+#ifdef _WIN32
+        fprintf(stderr, "  DDI files not found: put them in %%LOCALAPPDATA%%\\rplayhub\\iOS_DDI or beside cdhost.exe "
+                        "(iOS_DDI\\Restore\\BuildManifest.plist ...), or set RPLAY_DDI to an iOS_DDI directory\n");
+#else
         fprintf(stderr, "  DDI files not found: run scripts/fetch-ddi.sh, or set RPLAY_DDI to an iOS_DDI directory\n");
+#endif
         return RP_DDI_NO_DDI;
     }
 

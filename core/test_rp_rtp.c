@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 static void on_nal(void *ctx, const uint8_t *nal, size_t len)
 {
@@ -21,6 +25,12 @@ static void on_nal(void *ctx, const uint8_t *nal, size_t len)
 
 int main(void)
 {
+#ifdef _WIN32
+    /* Both streams are binary. In the CRT's default text mode a 0x1A byte reads as end-of-file
+     * and every 0x0A written becomes 0D 0A, so the byte-compare would fail on any real capture. */
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     static uint8_t storage[(size_t)RP_RTP_REORDER_WINDOW * 1500 + RP_RTP_MAX_NAL];
     rp_rtp_session s;
     if (rp_rtp_init(&s, RP_RTP_CODEC_HEVC, storage, sizeof storage, on_nal, stdout) != 0) {

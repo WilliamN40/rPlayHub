@@ -9,8 +9,22 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <stdint.h>
+#include <pthread.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
@@ -145,11 +159,53 @@ int cdhost_device_info(const char *udid, char *json, size_t cap)
  * default lockdown domain without a session, so every device is named -- paired or not -- as
  * Device Hub shows them. USB and Network entries for one phone collapse to a single row (USB
  * preferred). device_id is no longer needed (the library keys on udid). */
+#ifdef _WIN32
+/* Is anything listening on Apple Mobile Device Service's port? On Windows a connect to a closed
+ * localhost port is not refused at once -- the stack retransmits the SYN and gives up after ~2 s --
+ * and libusbmuxd connects more than once per listing, so with the service missing every
+ * list_devices took longer than a client's read timeout. A non-blocking connect with a short
+ * deadline answers in at most 300 ms. Skipped when USBMUXD_SOCKET_ADDRESS points libusbmuxd
+ * somewhere else. */
+static int usbmuxd_port_open(void)
+{
+    const char *custom = getenv("USBMUXD_SOCKET_ADDRESS");
+    if (custom && *custom) return 1;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 1;           /* cannot tell; let libusbmuxd decide */
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(27015);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int open = 0;
+    if (connect(s, (struct sockaddr *)&a, sizeof a) == 0) {
+        open = 1;
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set wr, ex;
+        FD_ZERO(&wr); FD_ZERO(&ex);
+        FD_SET(s, &wr); FD_SET(s, &ex);
+        struct timeval tv = { 0, 300000 };
+        if (select(0, NULL, &wr, &ex, &tv) > 0 && FD_ISSET(s, &wr) && !FD_ISSET(s, &ex)) open = 1;
+    }
+    closesocket(s);
+    return open;
+}
+#endif
+
 int usbmux_enumerate(api_device *out, int max)
 {
+#ifdef _WIN32
+    if (!usbmuxd_port_open()) return -1;
+#endif
     idevice_info_t *list = NULL;
     int count = 0;
-    if (idevice_get_device_list_extended(&list, &count) != IDEVICE_E_SUCCESS) return 0;
+    /* libimobiledevice returns an error (IDEVICE_E_NO_DEVICE) only when usbmuxd_get_device_list
+     * itself fails -- i.e. the mux cannot be reached at all. Zero devices is SUCCESS with count 0.
+     * Keep the two apart: the GUI says "install Apple Devices" for one and "plug in a phone" for
+     * the other. */
+    if (idevice_get_device_list_extended(&list, &count) != IDEVICE_E_SUCCESS) return -1;
 
     int n = 0;
     for (int i = 0; i < count && n < max; i++) {
@@ -213,37 +269,87 @@ int usbmux_enumerate(api_device *out, int max)
 
 /* libimobiledevice's connect to a network device has no short timeout: if the target phone is not
  * reachable when a bringup runs (a wifi device that dropped, a re-exec onto the wrong device), the
- * whole daemon hangs for the OS TCP timeout or longer. A watchdog bounds it -- a stuck bringup
- * exits cleanly with a clear message rather than locking up (under launchd, that restarts on the
- * default device; a manual run just exits). 30s is generous: a healthy bringup takes ~1-2s. */
-static void imd_bringup_timeout(int sig)
+ * whole daemon hangs for the OS TCP timeout or longer. A watchdog bounds it: 30 s is generous, a
+ * healthy bringup takes ~1-2 s.
+ *
+ * When it fires, the engine RELAUNCHES rather than exiting (cdhost_bringup_timed_out): the API
+ * must stay up for the GUI, and the stuck call cannot be cancelled in place. That needs ordinary
+ * code -- printf, getenv, mutexes, CreateProcess/execv -- none of which is async-signal-safe, so
+ * the watchdog is a thread on every platform (it used to be SIGALRM on POSIX), waiting on a
+ * condition the bringup signals when it finishes. Every return path disarms it. */
+#define BRINGUP_TIMEOUT_S 30
+
+static pthread_mutex_t g_wd_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_wd_cv = PTHREAD_COND_INITIALIZER;
+static unsigned        g_wd_gen;       /* bumped per arm, so a stale thread knows it is stale */
+static int             g_wd_armed;
+
+static void *watchdog_thread(void *arg)
 {
-    (void)sig;
-    static const char msg[] = "\n  bringup timed out (30s): the device is not reachable. "
-                              "Is it on this network and unlocked?\n";
-    if (write(2, msg, sizeof msg - 1)) { /* ignore */ }
-    _exit(2);
+    unsigned gen = (unsigned)(uintptr_t)arg;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += BRINGUP_TIMEOUT_S;
+    pthread_mutex_lock(&g_wd_mu);
+    int fired = 0;
+    while (g_wd_armed && g_wd_gen == gen) {
+        if (pthread_cond_timedwait(&g_wd_cv, &g_wd_mu, &deadline) == ETIMEDOUT) {
+            fired = g_wd_armed && g_wd_gen == gen;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_wd_mu);
+    if (fired) {
+        fprintf(stderr, "\n  bringup timed out (%ds): the device is not reachable. Is it on this "
+                        "network and unlocked? Restarting the engine.\n", BRINGUP_TIMEOUT_S);
+        cdhost_bringup_timed_out();     /* does not return */
+    }
+    return NULL;
 }
 
-int imd_bringup(void **out_conn, char *udid_out, size_t udidlen,
-                char *devname, size_t dnlen, char *prodver, size_t pvlen)
+static void watchdog_arm(void)
 {
-#ifndef _WIN32
-    signal(SIGALRM, imd_bringup_timeout);
-    alarm(30);
-#endif
-    printf("== Layer 0: usbmux (libusbmuxd) ==\n");
-    api_device devs[API_MAX_DEVICES];
-    int n = usbmux_enumerate(devs, API_MAX_DEVICES);
-    if (n <= 0) { fprintf(stderr, "no devices\n"); return -1; }
-    const char *want = getenv("RPLAY_UDID");
+    pthread_mutex_lock(&g_wd_mu);
+    unsigned gen = ++g_wd_gen;
+    g_wd_armed = 1;
+    pthread_mutex_unlock(&g_wd_mu);
+    pthread_t t;
+    if (pthread_create(&t, NULL, watchdog_thread, (void *)(uintptr_t)gen) == 0) pthread_detach(t);
+}
+
+static void watchdog_disarm(void)
+{
+    pthread_mutex_lock(&g_wd_mu);
+    g_wd_armed = 0;
+    pthread_cond_broadcast(&g_wd_cv);
+    pthread_mutex_unlock(&g_wd_mu);
+}
+
+int imd_pick_device(const api_device *devs, int n, const char *want)
+{
     int chosen = -1;
     for (int i = 0; i < n; i++) {
-        printf("  udid=%s conn=%s\n", devs[i].udid, devs[i].connection);
         if (want && *want) { if (!strncmp(devs[i].udid, want, strlen(want)) && chosen < 0) chosen = i; }
         else if (chosen < 0 || (!strcmp(devs[i].connection, "USB") && strcmp(devs[chosen].connection, "USB")))
             chosen = i;   /* prefer USB when a phone is on both transports (wifi displayservice is flakier) */
     }
+    return chosen;
+}
+
+/* The device handle the CoreDeviceProxy connection rides on; kept for the daemon's life once a
+ * bringup succeeds, released by imd_conn_close if the caller abandons the connection. */
+static idevice_t g_dev;
+
+static int bringup(const char *want, void **out_conn, char *udid_out, size_t udidlen,
+                   char *devname, size_t dnlen, char *prodver, size_t pvlen)
+{
+    printf("  enumerating devices for bring-up\n");
+    api_device devs[API_MAX_DEVICES];
+    int n = usbmux_enumerate(devs, API_MAX_DEVICES);
+    if (n < 0) { fprintf(stderr, "usbmuxd is not reachable\n"); return -1; }
+    if (n == 0) { fprintf(stderr, "no devices\n"); return -1; }
+    for (int i = 0; i < n; i++) printf("  udid=%s conn=%s\n", devs[i].udid, devs[i].connection);
+    int chosen = imd_pick_device(devs, n, want);
     if (chosen < 0) { fprintf(stderr, "no matching device\n"); return -1; }
     snprintf(udid_out, udidlen, "%s", devs[chosen].udid);
     printf("  -> using the %s entry (%s)\n", devs[chosen].connection, udid_out);
@@ -295,11 +401,24 @@ int imd_bringup(void **out_conn, char *udid_out, size_t udidlen,
     lockdownd_service_descriptor_free(svc);
     lockdownd_client_free(lk);          /* the service is started; the client is no longer needed */
     /* dev is intentionally NOT freed: the connection rides on it for the daemon's life. */
-#ifndef _WIN32
-    alarm(0);            /* bringup done; the pump has its own (blocking) timeout handling */
-#endif
+    g_dev = dev;
     *out_conn = conn;
     return 0;
+}
+
+int imd_bringup(const char *want, void **out_conn, char *udid_out, size_t udidlen,
+                char *devname, size_t dnlen, char *prodver, size_t pvlen)
+{
+    watchdog_arm();
+    int rc = bringup(want, out_conn, udid_out, udidlen, devname, dnlen, prodver, pvlen);
+    watchdog_disarm();   /* bringup done (or failed); the pump has its own (blocking) timeout handling */
+    return rc;
+}
+
+void imd_conn_close(void *conn)
+{
+    if (conn) idevice_disconnect((idevice_connection_t)conn);
+    if (g_dev) { idevice_free(g_dev); g_dev = NULL; }
 }
 
 /* Blocking send/recv over the idevice connection, for conn_t in cdhost.c (which cannot include

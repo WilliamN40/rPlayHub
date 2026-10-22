@@ -1,0 +1,6 @@
+# Shell scripts and patches must stay LF even on a Windows checkout with core.autocrlf=true:
+# bash and patch both reject CRLF, and scripts/build-windows.sh runs them under MSYS2.
+*.sh     text eol=lf
+*.patch  text eol=lf
+*.py     text eol=lf
+*.bat    text eol=crlf

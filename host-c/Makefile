@@ -69,13 +69,25 @@ LDFLAGS += $(IMD_LIBS)
 ifneq ($(UNAME),Darwin)
   LDFLAGS += -lpthread
 endif
+# Windows (MSYS2 MinGW/UCRT64): Winsock, and winmm for timeBeginPeriod(1) -- without it every
+# short sleep (swipe pacing, RTCP timers) rounds up to the 15.6 ms scheduler tick.
 ifeq ($(OS),Windows_NT)
-  LDFLAGS += -lws2_32
+  WINDOWS := 1
 else ifneq (,$(findstring NT,$(UNAME)))
-  LDFLAGS += -lws2_32
+  WINDOWS := 1
+endif
+ifeq ($(WINDOWS),1)
+  WINLIBS := -lws2_32 -lwinmm     # appended last on the link line, after OpenSSL and zlib
+  EXE := .exe
 endif
 
 ifeq ($(TLS),mbedtls)
+  # Refused rather than left to fail at link time. The tls.h layer (tls_openssl.c/tls_mbedtls.c)
+  # is vestigial: nothing calls rp_tls_connect any more -- the CoreDeviceProxy TLS is
+  # libimobiledevice's -- and ddi.c (the TSS request to gs.apple.com) plus libimobiledevice itself
+  # use OpenSSL directly, so an mbedtls build would still need OpenSSL and would not link without
+  # it. ../deps/mbedtls is not vendored in this tree either.
+  $(error TLS=mbedtls is not supported: the engine needs OpenSSL (ddi.c, libimobiledevice); build with the default TLS=openssl)
   # Compiled from the vendored source rather than linked against a system library, so the same
   # command works on every platform.
   MBEDTLS_SRC := $(wildcard $(MBEDTLS_ROOT)/library/*.c)
@@ -97,9 +109,10 @@ endif
 # The protocol core is shared with the app and the ports, so it is compiled from ../core rather
 # than duplicated here. Those files are platform-neutral by design -- no sockets, no allocation,
 # no Apple headers -- which is what lets the same objects build on Linux and Windows.
-# Userspace TCP/IP over the tunnel (lwIP) -- removes the root utun. Compiled in always; the
-# engine uses it only when RPLAY_USERSPACE_NET=1 (default stays the kernel utun). This is what
-# makes the engine run unprivileged and portable (no TUN device on Linux).
+# Userspace TCP/IP over the tunnel (lwIP) -- removes the root utun. Compiled in always. It is the
+# default on Linux and Windows (there is no kernel tunnel path there); on macOS the default stays
+# the kernel utun and RPLAY_USERSPACE_NET=1 opts in. This is what makes the engine run
+# unprivileged and portable (no TUN device on Linux, no driver on Windows).
 LWIP_DIR  := ../deps/lwip
 LWIP_PORT := $(LWIP_DIR)/contrib/ports/unix/port
 # HAVE_USERNET compiles media.c's userspace (lwIP) networking path. The macOS app also builds
@@ -126,14 +139,23 @@ CORE_SRC := $(CORE_DIR)/rp_xpc.c $(CORE_DIR)/rp_http2.c $(CORE_DIR)/rp_remotexpc
             $(CORE_DIR)/rp_rtp.c $(CORE_DIR)/rp_rtp_assembler.c $(CORE_DIR)/rp_rtcp.c
 CFLAGS   += -I$(CORE_DIR)
 
-all: cdhost
+all: cdhost$(EXE)
 
-cdhost: cdhost.c api_server.c media.c ddi.c imd.c usernet.c tunio.c $(CORE_SRC) $(LWIP_SRC) $(TLS_SRC)
+HDRS := api_server.h compat.h ddi.h media.h tls.h usernet.h lwip-engine/lwipopts.h
+
+# $(EXE) so make sees the file the compiler actually writes (cdhost.exe on Windows) and does not
+# relink on every run. `make cdhost` still works there as an alias.
+cdhost$(EXE): cdhost.c api_server.c media.c ddi.c imd.c usernet.c tunio.c $(HDRS) $(CORE_SRC) $(LWIP_SRC) $(TLS_SRC)
 	@echo "  TLS backend: $(TLS)"
-	$(CC) $(CFLAGS) -o $@ cdhost.c api_server.c media.c ddi.c imd.c usernet.c tunio.c $(CORE_SRC) $(LWIP_SRC) $(TLS_SRC) $(LDFLAGS) -lz $(if $(filter Windows_NT,$(OS)),-lws2_32,)
+	$(CC) $(CFLAGS) -o $@ cdhost.c api_server.c media.c ddi.c imd.c usernet.c tunio.c $(CORE_SRC) $(LWIP_SRC) $(TLS_SRC) $(LDFLAGS) -lz $(WINLIBS)
 	$(if $(filter 1,$(STATIC)),strip $@)
 
+ifneq ($(EXE),)
+cdhost: cdhost$(EXE)
+.PHONY: cdhost
+endif
+
 clean:
-	rm -f cdhost
+	rm -f cdhost cdhost.exe
 
 .PHONY: all clean
