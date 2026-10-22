@@ -7,6 +7,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+/* <io.h> before the macro, as stream-core.c and rplay-gui.cpp do: it declares close(int), and if
+ * a later header (SDL's, on newer MSYS2) pulls it in after the #define, the prototype becomes a
+ * conflicting closesocket(int) -- which is how Windows CI failed while local builds passed. */
+#include <io.h>
 typedef intptr_t ssize_t;
 #define sleep(x) Sleep((x)*1000)
 #define close closesocket
